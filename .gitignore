@@ -1,0 +1,4 @@
+.vscode/
+ckpts/
+__pycache__/
+*.py[cod]
