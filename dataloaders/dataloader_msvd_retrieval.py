@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 from __future__ import print_function
 
 import os
+import json
 from torch.utils.data import Dataset
 import numpy as np
 import pickle
@@ -43,13 +44,22 @@ class MSVD_DataLoader(Dataset):
         video_id_path_dict["train"] = os.path.join(self.data_path, "train_list.txt")
         video_id_path_dict["val"] = os.path.join(self.data_path, "val_list.txt")
         video_id_path_dict["test"] = os.path.join(self.data_path, "test_list.txt")
-        caption_file = os.path.join(self.data_path, "raw-captions.pkl")
+
+        json_file = os.path.join(self.data_path, f"msvd_{self.subset}.json")
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
         with open(video_id_path_dict[self.subset], 'r') as fp:
             video_ids = [itm.strip() for itm in fp.readlines()]
 
-        with open(caption_file, 'rb') as f:
-            captions = pickle.load(f)
+        captions = {}
+        for item in data:
+            vid = item["video_id"]
+            caps = item.get("caption", [])
+            if isinstance(caps, str):
+                caps = [caps]
+            # 这里保持和后续代码一致：captions[vid] 是 list，每个元素是“一个 caption 字符串”
+            captions[vid] = [c.strip() for c in caps if isinstance(c, str) and c.strip()]
 
         video_dict = {}
         for root, dub_dir, video_files in os.walk(self.features_path):
@@ -67,7 +77,7 @@ class MSVD_DataLoader(Dataset):
         for video_id in video_ids:
             assert video_id in captions
             for cap in captions[video_id]:
-                cap_txt = " ".join(cap)
+                cap_txt = cap
                 self.sentences_dict[len(self.sentences_dict)] = (video_id, cap_txt)
             self.cut_off_points.append(len(self.sentences_dict))
 

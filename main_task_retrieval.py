@@ -17,8 +17,9 @@ from modules.optimization import BertAdam
 
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
+import datetime as dt
 
-torch.distributed.init_process_group(backend="nccl")
+torch.distributed.init_process_group(backend="nccl", timeout=dt.timedelta(hours=2))
 
 global logger
 
@@ -75,7 +76,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument("--datatype", default="msrvtt", type=str, help="Point the dataset to finetune.")
 
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
+    parser.add_argument("--local-rank", default=0, type=int, help="distribted training")
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--coef_lr', type=float, default=1., help='coefficient for bert branch.')
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
@@ -390,7 +391,8 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         # ----------------------------------
         # 2. calculate the similarity
         # ----------------------------------
-        if n_gpu > 1:
+        ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if (not ddp) and (n_gpu > 1):
             device_ids = list(range(n_gpu))
             batch_list_t_splits = []
             batch_list_v_splits = []
@@ -563,11 +565,11 @@ def main():
                 # logger.info("Eval on val dataset")
                 # R1 = eval_epoch(args, model, val_dataloader, device, n_gpu)
 
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu)
-                if best_score <= R1:
-                    best_score = R1
-                    best_output_model_file = output_model_file
-                logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
+                # R1 = eval_epoch(args, model, test_dataloader, device, n_gpu)
+                # if best_score <= R1:
+                #     best_score = R1
+                #     best_output_model_file = output_model_file
+                # logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
 
         ## Uncomment if want to test on the best checkpoint
         # if args.local_rank == 0:
