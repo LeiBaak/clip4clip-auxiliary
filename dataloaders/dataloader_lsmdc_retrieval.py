@@ -9,6 +9,7 @@ import numpy as np
 import json
 import math
 from dataloaders.rawvideo_util import RawVideoExtractor
+from dataloaders.text_branch_utils import load_text_branch_records, get_text_branches_from_records
 
 class LSMDC_DataLoader(Dataset):
     """LSMDC dataset loader."""
@@ -24,6 +25,7 @@ class LSMDC_DataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+                branch_cache_path="",
     ):
         self.data_path = data_path
         self.features_path = features_path
@@ -37,6 +39,8 @@ class LSMDC_DataLoader(Dataset):
         # 0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
+
+        self.branch_records = load_text_branch_records(cache_path=branch_cache_path, cache_name="lsmdc_records")
 
         self.subset = subset
         assert self.subset in ["train", "val", "test"]
@@ -153,6 +157,31 @@ class LSMDC_DataLoader(Dataset):
 
         return pairs_text, pairs_mask, pairs_segment, choice_video_ids
 
+    def _get_text_from_string(self, sentence):
+        pairs_text = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_mask = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_segment = np.zeros((1, self.max_words), dtype=np.long)
+
+        words = self.tokenizer.tokenize(sentence)
+        words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
+        total_length_with_CLS = self.max_words - 1
+        if len(words) > total_length_with_CLS:
+            words = words[:total_length_with_CLS]
+        words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(words)
+        input_mask = [1] * len(input_ids)
+        segment_ids = [0] * len(input_ids)
+        while len(input_ids) < self.max_words:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+
+        pairs_text[0] = np.array(input_ids)
+        pairs_mask[0] = np.array(input_mask)
+        pairs_segment[0] = np.array(segment_ids)
+        return pairs_text, pairs_mask, pairs_segment
+
     def _get_rawvideo(self, choice_video_ids):
         video_mask = np.zeros((len(choice_video_ids), self.max_frames), dtype=np.long)
         max_video_length = [0] * len(choice_video_ids)
@@ -203,6 +232,17 @@ class LSMDC_DataLoader(Dataset):
 
     def __getitem__(self, feature_idx):
         clip_id, sentence = self.iter2video_pairs_dict[feature_idx]
+        text_branches = get_text_branches_from_records(self.branch_records, feature_idx, sentence, require_match=True)
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(clip_id, sentence)
+        entity_text, entity_mask, entity_segment = self._get_text_from_string(text_branches["entity_text"])
+        action_text, action_mask, action_segment = self._get_text_from_string(text_branches["action_text"])
         video, video_mask = self._get_rawvideo(choice_video_ids)
-        return pairs_text, pairs_mask, pairs_segment, video, video_mask
+        entity_fallback = np.array([text_branches["entity_fallback"]], dtype=np.long)
+        action_fallback = np.array([text_branches["action_fallback"]], dtype=np.long)
+        return (
+            pairs_text, pairs_mask, pairs_segment,
+            entity_text, entity_mask, entity_segment,
+            action_text, action_mask, action_segment,
+            entity_fallback, action_fallback,
+            video, video_mask,
+        )

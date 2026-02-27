@@ -68,3 +68,78 @@ def tensor_video_to_text_sim(sim_tensor):
     # Forms a similarity matrix for use with rank at k
     values, _ = torch.max(sim_tensor, dim=1, keepdim=True)
     return torch.squeeze(values).T
+
+
+def search_fusion_weights(val_scores_global, val_scores_entity, val_scores_action, val_labels, step=0.1):
+    """
+    Search fixed fusion weights for three-branch retrieval scores.
+
+    Inputs:
+        val_scores_global: np.ndarray, shape [N, M] or [V, S, V]
+        val_scores_entity: np.ndarray, same shape as val_scores_global
+        val_scores_action: np.ndarray, same shape as val_scores_global
+        val_labels: reserved for API compatibility (unused in A1; diagonal match assumed)
+        step: float, grid step size in [0, 1]
+
+    Output:
+        dict with:
+            best_weights: {"w_g": float, "w_e": float, "w_a": float}
+            best_metrics: {"R1": float, "R5": float, "R10": float}
+            best_sim_matrix: fused score matrix with best weights
+    """
+    global_scores = np.asarray(val_scores_global)
+    entity_scores = np.asarray(val_scores_entity)
+    action_scores = np.asarray(val_scores_action)
+
+    if not (global_scores.shape == entity_scores.shape == action_scores.shape):
+        raise ValueError("Fusion score matrices must have identical shapes.")
+
+    step = float(step)
+    if step <= 0 or step > 1:
+        raise ValueError("step must be in (0, 1].")
+
+    grid = np.arange(0.0, 1.0 + 1e-8, step)
+    best = {
+        "w_g": 1.0,
+        "w_e": 0.0,
+        "w_a": 0.0,
+        "R1": -1.0,
+        "R5": -1.0,
+        "R10": -1.0,
+    }
+    best_sim_matrix = global_scores
+
+    for w_g in grid:
+        for w_e in grid:
+            w_a = 1.0 - w_g - w_e
+            if w_a < -1e-8 or w_a > 1.0 + 1e-8:
+                continue
+            w_a = min(max(w_a, 0.0), 1.0)
+
+            fused = w_g * global_scores + w_e * entity_scores + w_a * action_scores
+
+            if fused.ndim == 3:
+                tv_metrics = tensor_text_to_video_metrics(fused)
+            else:
+                tv_metrics = compute_metrics(fused)
+
+            r1, r5, r10 = tv_metrics["R1"], tv_metrics["R5"], tv_metrics["R10"]
+            is_better = (r1 > best["R1"]) or \
+                        (r1 == best["R1"] and r5 > best["R5"]) or \
+                        (r1 == best["R1"] and r5 == best["R5"] and r10 > best["R10"])
+            if is_better:
+                best.update({
+                    "w_g": float(w_g),
+                    "w_e": float(w_e),
+                    "w_a": float(w_a),
+                    "R1": float(r1),
+                    "R5": float(r5),
+                    "R10": float(r10),
+                })
+                best_sim_matrix = fused
+
+    return {
+        "best_weights": {"w_g": best["w_g"], "w_e": best["w_e"], "w_a": best["w_a"]},
+        "best_metrics": {"R1": best["R1"], "R5": best["R5"], "R10": best["R10"]},
+        "best_sim_matrix": best_sim_matrix,
+    }

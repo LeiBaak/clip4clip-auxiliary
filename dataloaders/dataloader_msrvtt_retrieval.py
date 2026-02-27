@@ -11,6 +11,7 @@ from collections import defaultdict
 import json
 import random
 from dataloaders.rawvideo_util import RawVideoExtractor
+from dataloaders.text_branch_utils import load_text_branch_records, get_text_branches_from_records
 
 class MSRVTT_DataLoader(Dataset):
     """MSRVTT dataset loader."""
@@ -25,6 +26,7 @@ class MSRVTT_DataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+                branch_cache_path="",
     ):
         self.data = pd.read_csv(csv_path)
         self.features_path = features_path
@@ -38,6 +40,10 @@ class MSRVTT_DataLoader(Dataset):
         # 0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
+
+        self.branch_records = load_text_branch_records(cache_path=branch_cache_path, cache_name="msrvtt_records")
+        if len(self.branch_records) != len(self.data):
+            raise RuntimeError("MSRVTT records size mismatch: {} vs {}".format(len(self.branch_records), len(self.data)))
 
         self.rawVideoExtractor = RawVideoExtractor(framerate=feature_framerate, size=image_resolution)
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
@@ -80,6 +86,31 @@ class MSRVTT_DataLoader(Dataset):
             pairs_segment[i] = np.array(segment_ids)
 
         return pairs_text, pairs_mask, pairs_segment, choice_video_ids
+
+    def _get_text_from_string(self, sentence):
+        pairs_text = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_mask = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_segment = np.zeros((1, self.max_words), dtype=np.long)
+
+        words = self.tokenizer.tokenize(sentence)
+        words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
+        total_length_with_CLS = self.max_words - 1
+        if len(words) > total_length_with_CLS:
+            words = words[:total_length_with_CLS]
+        words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(words)
+        input_mask = [1] * len(input_ids)
+        segment_ids = [0] * len(input_ids)
+        while len(input_ids) < self.max_words:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+
+        pairs_text[0] = np.array(input_ids)
+        pairs_mask[0] = np.array(input_mask)
+        pairs_segment[0] = np.array(segment_ids)
+        return pairs_text, pairs_mask, pairs_segment
 
     def _get_rawvideo(self, choice_video_ids):
         video_mask = np.zeros((len(choice_video_ids), self.max_frames), dtype=np.long)
@@ -132,9 +163,20 @@ class MSRVTT_DataLoader(Dataset):
         video_id = self.data['video_id'].values[idx]
         sentence = self.data['sentence'].values[idx]
 
+        text_branches = get_text_branches_from_records(self.branch_records, idx, sentence, require_match=True)
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(video_id, sentence)
+        entity_text, entity_mask, entity_segment = self._get_text_from_string(text_branches["entity_text"])
+        action_text, action_mask, action_segment = self._get_text_from_string(text_branches["action_text"])
         video, video_mask = self._get_rawvideo(choice_video_ids)
-        return pairs_text, pairs_mask, pairs_segment, video, video_mask
+        entity_fallback = np.array([text_branches["entity_fallback"]], dtype=np.long)
+        action_fallback = np.array([text_branches["action_fallback"]], dtype=np.long)
+        return (
+            pairs_text, pairs_mask, pairs_segment,
+            entity_text, entity_mask, entity_segment,
+            action_text, action_mask, action_segment,
+            entity_fallback, action_fallback,
+            video, video_mask,
+        )
 
 class MSRVTT_TrainDataLoader(Dataset):
     """MSRVTT train dataset loader."""
@@ -151,6 +193,7 @@ class MSRVTT_TrainDataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+                branch_cache_path="",
     ):
         self.csv = pd.read_csv(csv_path)
         self.data = json.load(open(json_path, 'r'))
@@ -166,6 +209,8 @@ class MSRVTT_TrainDataLoader(Dataset):
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
 
+        self.branch_records = load_text_branch_records(cache_path=branch_cache_path, cache_name="msrvtt_records")
+
         self.unfold_sentences = unfold_sentences
         self.sample_len = 0
         if self.unfold_sentences:
@@ -175,6 +220,12 @@ class MSRVTT_TrainDataLoader(Dataset):
                 if itm['video_id'] in train_video_ids:
                     self.sentences_dict[len(self.sentences_dict)] = (itm['video_id'], itm['caption'])
             self.sample_len = len(self.sentences_dict)
+            if len(self.branch_records) != self.sample_len:
+                raise RuntimeError(
+                    "MSRVTT train records size mismatch with unfold_sentences=True: {} vs {}".format(
+                        len(self.branch_records), self.sample_len
+                    )
+                )
         else:
             num_sentences = 0
             self.sentences = defaultdict(list)
@@ -193,6 +244,19 @@ class MSRVTT_TrainDataLoader(Dataset):
                 self.parent_ids[vid] = url_posfix
                 self.children_video_ids[url_posfix].append(vid)
             self.sample_len = len(self.csv)
+
+        if len(self.branch_records) != self.sample_len:
+            raise RuntimeError(
+                "MSRVTT train records size mismatch: records={} vs sample_len={} (unfold_sentences={})".format(
+                    len(self.branch_records), self.sample_len, self.unfold_sentences
+                )
+            )
+            if len(self.branch_records) != self.sample_len:
+                raise RuntimeError(
+                    "MSRVTT train records size mismatch with unfold_sentences=False: {} vs {}".format(
+                        len(self.branch_records), self.sample_len
+                    )
+                )
 
         self.rawVideoExtractor = RawVideoExtractor(framerate=feature_framerate, size=image_resolution)
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
@@ -236,6 +300,31 @@ class MSRVTT_TrainDataLoader(Dataset):
             pairs_segment[i] = np.array(segment_ids)
 
         return pairs_text, pairs_mask, pairs_segment, choice_video_ids
+
+    def _get_text_from_string(self, sentence):
+        pairs_text = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_mask = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_segment = np.zeros((1, self.max_words), dtype=np.long)
+
+        words = self.tokenizer.tokenize(sentence)
+        words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
+        total_length_with_CLS = self.max_words - 1
+        if len(words) > total_length_with_CLS:
+            words = words[:total_length_with_CLS]
+        words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(words)
+        input_mask = [1] * len(input_ids)
+        segment_ids = [0] * len(input_ids)
+        while len(input_ids) < self.max_words:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+
+        pairs_text[0] = np.array(input_ids)
+        pairs_mask[0] = np.array(input_mask)
+        pairs_segment[0] = np.array(segment_ids)
+        return pairs_text, pairs_mask, pairs_segment
 
     def _get_single_text(self, video_id):
         rind = random.randint(0, len(self.sentences[video_id]) - 1)
@@ -295,6 +384,21 @@ class MSRVTT_TrainDataLoader(Dataset):
             video_id, caption = self.sentences_dict[idx]
         else:
             video_id, caption = self.csv['video_id'].values[idx], None
+        caption_for_branch = caption
+        if caption_for_branch is None:
+            candidate = self.sentences.get(video_id, [])
+            caption_for_branch = candidate[0] if len(candidate) > 0 else ""
+        text_branches = get_text_branches_from_records(self.branch_records, idx, caption_for_branch, require_match=True)
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(video_id, caption)
+        entity_text, entity_mask, entity_segment = self._get_text_from_string(text_branches["entity_text"])
+        action_text, action_mask, action_segment = self._get_text_from_string(text_branches["action_text"])
         video, video_mask = self._get_rawvideo(choice_video_ids)
-        return pairs_text, pairs_mask, pairs_segment, video, video_mask
+        entity_fallback = np.array([text_branches["entity_fallback"]], dtype=np.long)
+        action_fallback = np.array([text_branches["action_fallback"]], dtype=np.long)
+        return (
+            pairs_text, pairs_mask, pairs_segment,
+            entity_text, entity_mask, entity_segment,
+            action_text, action_mask, action_segment,
+            entity_fallback, action_fallback,
+            video, video_mask,
+        )

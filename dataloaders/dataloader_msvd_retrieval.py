@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import pickle
 from dataloaders.rawvideo_util import RawVideoExtractor
+from dataloaders.text_branch_utils import _normalize_space
 
 class MSVD_DataLoader(Dataset):
     """MSVD dataset loader."""
@@ -24,6 +25,7 @@ class MSVD_DataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+            branch_cache_path="",
     ):
         self.data_path = data_path
         self.features_path = features_path
@@ -48,6 +50,9 @@ class MSVD_DataLoader(Dataset):
         json_file = os.path.join(self.data_path, f"msvd_{self.subset}.json")
         with open(json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
+
+        cache_path = branch_cache_path.strip() if isinstance(branch_cache_path, str) else ""
+        self.branch_cache_path = cache_path if cache_path else os.path.join(self.data_path, f"msvd_{self.subset}_text_branches.json")
 
         with open(video_id_path_dict[self.subset], 'r') as fp:
             video_ids = [itm.strip() for itm in fp.readlines()]
@@ -97,9 +102,61 @@ class MSVD_DataLoader(Dataset):
         print("Total Paire: {}".format(len(self.sentences_dict)))
 
         self.sample_len = len(self.sentences_dict)
+        self.branch_records = self._load_ordered_branch_records()
         self.rawVideoExtractor = RawVideoExtractor(framerate=feature_framerate, size=image_resolution)
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
                               "MASK_TOKEN": "[MASK]", "UNK_TOKEN": "[UNK]", "PAD_TOKEN": "[PAD]"}
+
+    def _load_ordered_branch_records(self):
+        if not os.path.exists(self.branch_cache_path):
+            raise FileNotFoundError("MSVD ordered text branch cache not found: {}".format(self.branch_cache_path))
+
+        with open(self.branch_cache_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+            raise RuntimeError(
+                "MSVD cache must be ordered records format with key 'records': {}".format(self.branch_cache_path)
+            )
+
+        records = payload["records"]
+        if len(records) != self.sample_len:
+            raise RuntimeError(
+                "MSVD cache size mismatch: records={} vs dataset_samples={} in {}".format(
+                    len(records), self.sample_len, self.branch_cache_path
+                )
+            )
+
+        normalized = []
+        for idx in range(self.sample_len):
+            video_id, caption = self.sentences_dict[idx]
+            rec = records[idx]
+            if not isinstance(rec, dict):
+                raise RuntimeError("Invalid record type at idx {} in {}".format(idx, self.branch_cache_path))
+
+            rec_vid = str(rec.get("video_id", "")).strip()
+            rec_cap = _normalize_space(rec.get("caption", ""))
+            if rec_vid != video_id or rec_cap != _normalize_space(caption):
+                raise RuntimeError(
+                    "MSVD cache alignment mismatch at idx {}: ({}, '{}') != ({}, '{}')".format(
+                        idx, rec_vid, rec_cap[:120], video_id, _normalize_space(caption)[:120]
+                    )
+                )
+
+            entity_text = _normalize_space(rec.get("entity_text", ""))
+            action_text = _normalize_space(rec.get("action_text", ""))
+            if not entity_text or not action_text:
+                raise RuntimeError("Incomplete entity/action text at idx {} in {}".format(idx, self.branch_cache_path))
+
+            normalized.append({
+                "entity_text": entity_text,
+                "action_text": action_text,
+                "entity_fallback": int(rec.get("entity_fallback", 1)),
+                "action_fallback": int(rec.get("action_fallback", 1)),
+            })
+
+        print("Loaded MSVD ordered text branch cache: {} ({} records)".format(self.branch_cache_path, len(normalized)))
+        return normalized
 
     def __len__(self):
         return self.sample_len
@@ -136,6 +193,31 @@ class MSVD_DataLoader(Dataset):
             pairs_segment[i] = np.array(segment_ids)
 
         return pairs_text, pairs_mask, pairs_segment, choice_video_ids
+
+    def _get_text_from_string(self, sentence):
+        pairs_text = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_mask = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_segment = np.zeros((1, self.max_words), dtype=np.long)
+
+        words = self.tokenizer.tokenize(sentence)
+        words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
+        total_length_with_CLS = self.max_words - 1
+        if len(words) > total_length_with_CLS:
+            words = words[:total_length_with_CLS]
+        words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(words)
+        input_mask = [1] * len(input_ids)
+        segment_ids = [0] * len(input_ids)
+        while len(input_ids) < self.max_words:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+
+        pairs_text[0] = np.array(input_ids)
+        pairs_mask[0] = np.array(input_mask)
+        pairs_segment[0] = np.array(segment_ids)
+        return pairs_text, pairs_mask, pairs_segment
 
     def _get_rawvideo(self, choice_video_ids):
         video_mask = np.zeros((len(choice_video_ids), self.max_frames), dtype=np.long)
@@ -185,6 +267,17 @@ class MSVD_DataLoader(Dataset):
     def __getitem__(self, idx):
         video_id, caption = self.sentences_dict[idx]
 
+        text_branches = self.branch_records[idx]
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(video_id, caption)
+        entity_text, entity_mask, entity_segment = self._get_text_from_string(text_branches["entity_text"])
+        action_text, action_mask, action_segment = self._get_text_from_string(text_branches["action_text"])
         video, video_mask = self._get_rawvideo(choice_video_ids)
-        return pairs_text, pairs_mask, pairs_segment, video, video_mask
+        entity_fallback = np.array([text_branches["entity_fallback"]], dtype=np.long)
+        action_fallback = np.array([text_branches["action_fallback"]], dtype=np.long)
+        return (
+            pairs_text, pairs_mask, pairs_segment,
+            entity_text, entity_mask, entity_segment,
+            action_text, action_mask, action_segment,
+            entity_fallback, action_fallback,
+            video, video_mask,
+        )

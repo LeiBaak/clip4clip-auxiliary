@@ -7,7 +7,7 @@ import torch
 import numpy as np
 import random
 import os
-from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
+from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim, search_fusion_weights
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
@@ -105,10 +105,23 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
 
+    parser.add_argument('--disable_entity_branch', action='store_true', help='Disable entity branch for ablation.')
+    parser.add_argument('--disable_action_branch', action='store_true', help='Disable action branch for ablation.')
+    parser.add_argument('--lambda_entity', type=float, default=0.3, help='Loss weight for entity branch.')
+    parser.add_argument('--lambda_action', type=float, default=0.3, help='Loss weight for action branch.')
+    parser.add_argument('--entity_word_pro_num', type=int, default=28, help='Number of text word prototypes for entity branch.')
+    parser.add_argument('--entity_patch_num', type=int, default=12, help='Number of visual patch prototypes (including CLS) for entity branch.')
+    parser.add_argument('--fusion_grid_step', type=float, default=0.1, help='Grid step for fixed fusion weights.')
+    parser.add_argument('--msvd_branch_cache_path', type=str, default='', help='Optional path to offline MSVD text branch cache JSON.')
+    parser.add_argument('--text_branch_cache_path', type=str, default='', help='Offline text-branch cache path or directory (preferred for all datasets).')
+
     args = parser.parse_args()
 
     if args.sim_header == "tightTransf":
         args.loose_type = False
+
+    args.use_entity_branch = not args.disable_entity_branch
+    args.use_action_branch = not args.disable_action_branch
 
     # Check paramenters
     if args.gradient_accumulation_steps < 1:
@@ -116,6 +129,10 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
             args.gradient_accumulation_steps))
     if not args.do_train and not args.do_eval:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
+    if args.entity_word_pro_num < 1:
+        raise ValueError("entity_word_pro_num must be >= 1")
+    if args.entity_patch_num < 2:
+        raise ValueError("entity_patch_num must be >= 2")
 
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
 
@@ -186,8 +203,14 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
     if hasattr(model, 'module'):
         model = model.module
 
+    if local_rank == 0:
+        logger.info("[prep_optimizer] rank=%d start", local_rank)
+
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+
+    if local_rank == 0:
+        logger.info("[prep_optimizer] rank=%d collected params: %d", local_rank, len(param_optimizer))
 
     decay_param_tp = [(n, p) for n, p in param_optimizer if not any(nd in n for nd in no_decay)]
     no_decay_param_tp = [(n, p) for n, p in param_optimizer if any(nd in n for nd in no_decay)]
@@ -206,14 +229,23 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
         {'params': [p for n, p in no_decay_noclip_param_tp], 'weight_decay': 0.0}
     ]
 
+    if local_rank == 0:
+        logger.info("[prep_optimizer] rank=%d param groups ready", local_rank)
+
     scheduler = None
     optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=args.warmup_proportion,
                          schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
                          t_total=num_train_optimization_steps, weight_decay=weight_decay,
                          max_grad_norm=1.0)
 
+    if local_rank == 0:
+        logger.info("[prep_optimizer] rank=%d optimizer ready, wrapping DDP...", local_rank)
+
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
                                                       output_device=local_rank, find_unused_parameters=True)
+
+    if local_rank == 0:
+        logger.info("[prep_optimizer] rank=%d DDP wrapper ready", local_rank)
 
     return optimizer, scheduler, model
 
@@ -257,14 +289,47 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
+    total_loss_global = 0
+    total_loss_entity = 0
+    total_loss_action = 0
+    total_score_global = 0
+    total_score_entity = 0
+    total_score_action = 0
+    total_entity_fallback = 0
+    total_action_fallback = 0
+    total_fallback_count = 0
 
     for step, batch in enumerate(train_dataloader):
         if n_gpu == 1:
             # multi-gpu does scattering it-self
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
-        input_ids, input_mask, segment_ids, video, video_mask = batch
-        loss = model(input_ids, segment_ids, input_mask, video, video_mask)
+        if len(batch) == 13:
+            input_ids, input_mask, segment_ids, \
+            entity_input_ids, entity_input_mask, entity_segment_ids, \
+            action_input_ids, action_input_mask, action_segment_ids, \
+            entity_fallback, action_fallback, video, video_mask = batch
+        else:
+            input_ids, input_mask, segment_ids, video, video_mask = batch
+            entity_input_ids, entity_input_mask, entity_segment_ids = input_ids, input_mask, segment_ids
+            action_input_ids, action_input_mask, action_segment_ids = input_ids, input_mask, segment_ids
+            entity_fallback = torch.zeros((input_ids.size(0), 1), device=input_ids.device)
+            action_fallback = torch.zeros((input_ids.size(0), 1), device=input_ids.device)
+
+        model_outputs = model(
+            input_ids,
+            segment_ids,
+            input_mask,
+            video,
+            video_mask,
+            entity_input_ids=entity_input_ids,
+            entity_token_type_ids=entity_segment_ids,
+            entity_attention_mask=entity_input_mask,
+            action_input_ids=action_input_ids,
+            action_token_type_ids=action_segment_ids,
+            action_attention_mask=action_input_mask,
+        )
+        loss = model_outputs["loss"] if isinstance(model_outputs, dict) else model_outputs
 
         if n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu.
@@ -274,6 +339,17 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         loss.backward()
 
         total_loss += float(loss)
+        if isinstance(model_outputs, dict):
+            total_loss_global += float(model_outputs["loss_global"])
+            total_loss_entity += float(model_outputs["loss_entity"])
+            total_loss_action += float(model_outputs["loss_action"])
+            total_score_global += float(model_outputs["score_global_mean"])
+            total_score_entity += float(model_outputs["score_entity_mean"])
+            total_score_action += float(model_outputs["score_action_mean"])
+        total_entity_fallback += float(entity_fallback.float().mean().item())
+        total_action_fallback += float(action_fallback.float().mean().item())
+        total_fallback_count += 1
+
         if (step + 1) % args.gradient_accumulation_steps == 0:
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -292,10 +368,18 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
-                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Time/step: %f", epoch + 1,
+                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Lg: %f, Le: %f, La: %f, Sg: %f, Se: %f, Sa: %f, EFb: %.4f, AFb: %.4f, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
+                            total_loss_global / max(step + 1, 1),
+                            total_loss_entity / max(step + 1, 1),
+                            total_loss_action / max(step + 1, 1),
+                            total_score_global / max(step + 1, 1),
+                            total_score_entity / max(step + 1, 1),
+                            total_score_action / max(step + 1, 1),
+                            total_entity_fallback / max(total_fallback_count, 1),
+                            total_action_fallback / max(total_fallback_count, 1),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
 
@@ -303,21 +387,42 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     return total_loss, global_step
 
 def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list):
-    sim_matrix = []
+    sim_matrix_global = []
+    sim_matrix_entity = []
+    sim_matrix_action = []
     for idx1, b1 in enumerate(batch_list_t):
-        input_mask, segment_ids, *_tmp = b1
-        sequence_output = batch_sequence_output_list[idx1]
-        each_row = []
+        input_mask, entity_input_mask, action_input_mask, *_tmp = b1
+        input_mask = input_mask.view(-1, input_mask.shape[-1])
+        entity_input_mask = entity_input_mask.view(-1, entity_input_mask.shape[-1])
+        action_input_mask = action_input_mask.view(-1, action_input_mask.shape[-1])
+        sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto = batch_sequence_output_list[idx1]
+        each_row_global = []
+        each_row_entity = []
+        each_row_action = []
         for idx2, b2 in enumerate(batch_list_v):
             video_mask, *_tmp = b2
-            visual_output = batch_visual_output_list[idx2]
-            b1b2_logits, *_tmp = model.get_similarity_logits(sequence_output, visual_output, input_mask, video_mask,
-                                                                     loose_type=model.loose_type)
-            b1b2_logits = b1b2_logits.cpu().detach().numpy()
-            each_row.append(b1b2_logits)
-        each_row = np.concatenate(tuple(each_row), axis=-1)
-        sim_matrix.append(each_row)
-    return sim_matrix
+            video_mask = video_mask.view(-1, video_mask.shape[-1])
+            visual_output, entity_video_patch_proto = batch_visual_output_list[idx2]
+            logits_global, logits_entity, logits_action = model.get_multi_branch_similarity_logits(
+                sequence_output,
+                entity_sequence_output,
+                action_sequence_output,
+                visual_output,
+                input_mask,
+                entity_input_mask,
+                action_input_mask,
+                video_mask,
+                entity_word_proto=entity_word_proto,
+                entity_video_patch_proto=entity_video_patch_proto,
+                loose_type=model.loose_type,
+            )
+            each_row_global.append(logits_global.cpu().detach().numpy())
+            each_row_entity.append(logits_entity.cpu().detach().numpy())
+            each_row_action.append(logits_action.cpu().detach().numpy())
+        sim_matrix_global.append(np.concatenate(tuple(each_row_global), axis=-1))
+        sim_matrix_entity.append(np.concatenate(tuple(each_row_entity), axis=-1))
+        sim_matrix_action.append(np.concatenate(tuple(each_row_action), axis=-1))
+    return sim_matrix_global, sim_matrix_entity, sim_matrix_action
 
 def eval_epoch(args, model, test_dataloader, device, n_gpu):
 
@@ -353,37 +458,69 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         batch_list_v = []
         batch_sequence_output_list, batch_visual_output_list = [], []
         total_video_num = 0
+        eval_entity_fallback = 0.0
+        eval_action_fallback = 0.0
+        eval_batch_count = 0
 
         # ----------------------------
         # 1. cache the features
         # ----------------------------
         for bid, batch in enumerate(test_dataloader):
             batch = tuple(t.to(device) for t in batch)
-            input_ids, input_mask, segment_ids, video, video_mask = batch
+            if len(batch) == 13:
+                input_ids, input_mask, segment_ids, \
+                entity_input_ids, entity_input_mask, entity_segment_ids, \
+                action_input_ids, action_input_mask, action_segment_ids, \
+                entity_fallback, action_fallback, video, video_mask = batch
+            else:
+                input_ids, input_mask, segment_ids, video, video_mask = batch
+                entity_input_ids, entity_input_mask, entity_segment_ids = input_ids, input_mask, segment_ids
+                action_input_ids, action_input_mask, action_segment_ids = input_ids, input_mask, segment_ids
+                entity_fallback = torch.zeros((input_ids.size(0), 1), device=input_ids.device)
+                action_fallback = torch.zeros((input_ids.size(0), 1), device=input_ids.device)
+
+            eval_entity_fallback += float(entity_fallback.float().mean().item())
+            eval_action_fallback += float(action_fallback.float().mean().item())
+            eval_batch_count += 1
 
             if multi_sentence_:
                 # multi-sentences retrieval means: one clip has two or more descriptions.
                 b, *_t = video.shape
                 sequence_output = model.get_sequence_output(input_ids, segment_ids, input_mask)
-                batch_sequence_output_list.append(sequence_output)
-                batch_list_t.append((input_mask, segment_ids,))
+                entity_sequence_output = model.get_sequence_output(entity_input_ids, entity_segment_ids, entity_input_mask)
+                action_sequence_output = model.get_sequence_output(action_input_ids, action_segment_ids, action_input_mask)
+                entity_word_proto = model.get_entity_text_word_prototypes(entity_input_ids, entity_input_mask)
+                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto))
+                batch_list_t.append((input_mask, entity_input_mask, action_input_mask,))
 
                 s_, e_ = total_video_num, total_video_num + b
                 filter_inds = [itm - s_ for itm in cut_off_points_ if itm >= s_ and itm < e_]
 
                 if len(filter_inds) > 0:
                     video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
-                    visual_output = model.get_visual_output(video, video_mask)
-                    batch_visual_output_list.append(visual_output)
+                    visual_output, visual_tokens = model.get_visual_output(video, video_mask, return_hidden_visual=True)
+                    entity_video_patch_proto = model.get_entity_video_patch_prototypes(visual_tokens)
+                    batch_visual_output_list.append((visual_output, entity_video_patch_proto))
                     batch_list_v.append((video_mask,))
                 total_video_num += b
             else:
-                sequence_output, visual_output = model.get_sequence_visual_output(input_ids, segment_ids, input_mask, video, video_mask)
+                sequence_output, visual_output, visual_tokens = model.get_sequence_visual_output(
+                    input_ids,
+                    segment_ids,
+                    input_mask,
+                    video,
+                    video_mask,
+                    return_hidden_visual=True,
+                )
+                entity_sequence_output = model.get_sequence_output(entity_input_ids, entity_segment_ids, entity_input_mask)
+                action_sequence_output = model.get_sequence_output(action_input_ids, action_segment_ids, action_input_mask)
+                entity_word_proto = model.get_entity_text_word_prototypes(entity_input_ids, entity_input_mask)
+                entity_video_patch_proto = model.get_entity_video_patch_prototypes(visual_tokens)
 
-                batch_sequence_output_list.append(sequence_output)
-                batch_list_t.append((input_mask, segment_ids,))
+                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto))
+                batch_list_t.append((input_mask, entity_input_mask, action_input_mask,))
 
-                batch_visual_output_list.append(visual_output)
+                batch_visual_output_list.append((visual_output, entity_video_patch_proto))
                 batch_list_v.append((video_mask,))
 
             print("{}/{}\r".format(bid, len(test_dataloader)), end="")
@@ -415,50 +552,109 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                     devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_v]
                     batch_list_v_splits.append(devc_batch_list)
 
-                    devc_batch_list = [b.to(devc) for b in batch_sequence_output_list[s_:e_]]
+                    devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_sequence_output_list[s_:e_]]
                     batch_t_output_splits.append(devc_batch_list)
-                    devc_batch_list = [b.to(devc) for b in batch_visual_output_list]
+                    devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_visual_output_list]
                     batch_v_output_splits.append(devc_batch_list)
 
             parameters_tuple_list = [(batch_list_t_splits[dev_id], batch_list_v_splits[dev_id],
                                       batch_t_output_splits[dev_id], batch_v_output_splits[dev_id]) for dev_id in device_ids]
             parallel_outputs = parallel_apply(_run_on_single_gpu, model, parameters_tuple_list, device_ids)
-            sim_matrix = []
+            sim_matrix_global = []
+            sim_matrix_entity = []
+            sim_matrix_action = []
             for idx in range(len(parallel_outputs)):
-                sim_matrix += parallel_outputs[idx]
-            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+                sim_matrix_global += parallel_outputs[idx][0]
+                sim_matrix_entity += parallel_outputs[idx][1]
+                sim_matrix_action += parallel_outputs[idx][2]
+            sim_matrix_global = np.concatenate(tuple(sim_matrix_global), axis=0)
+            sim_matrix_entity = np.concatenate(tuple(sim_matrix_entity), axis=0)
+            sim_matrix_action = np.concatenate(tuple(sim_matrix_action), axis=0)
         else:
-            sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list)
-            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+            sim_matrix_global, sim_matrix_entity, sim_matrix_action = _run_on_single_gpu(
+                model,
+                batch_list_t,
+                batch_list_v,
+                batch_sequence_output_list,
+                batch_visual_output_list,
+            )
+            sim_matrix_global = np.concatenate(tuple(sim_matrix_global), axis=0)
+            sim_matrix_entity = np.concatenate(tuple(sim_matrix_entity), axis=0)
+            sim_matrix_action = np.concatenate(tuple(sim_matrix_action), axis=0)
 
-    if multi_sentence_:
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+    def _reshape_multi_sentence(sim_matrix):
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
-        max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
+        max_length = max([e_-s_ for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_)])
         sim_matrix_new = []
         for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
             sim_matrix_new.append(np.concatenate((sim_matrix[s_:e_],
                                                   np.full((max_length-e_+s_, sim_matrix.shape[1]), -np.inf)), axis=0))
-        sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
-        logger.info("after reshape, sim matrix size: {} x {} x {}".
-                    format(sim_matrix.shape[0], sim_matrix.shape[1], sim_matrix.shape[2]))
+        return np.stack(tuple(sim_matrix_new), axis=0)
 
-        tv_metrics = tensor_text_to_video_metrics(sim_matrix)
-        vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
+    if multi_sentence_:
+        logger.info("before reshape, global/entity/action matrix size: {} x {}".format(sim_matrix_global.shape[0], sim_matrix_global.shape[1]))
+        sim_matrix_global = _reshape_multi_sentence(sim_matrix_global)
+        sim_matrix_entity = _reshape_multi_sentence(sim_matrix_entity)
+        sim_matrix_action = _reshape_multi_sentence(sim_matrix_action)
+        logger.info("after reshape, global matrix size: {} x {} x {}".
+                    format(sim_matrix_global.shape[0], sim_matrix_global.shape[1], sim_matrix_global.shape[2]))
+
+        tv_metrics_global = tensor_text_to_video_metrics(sim_matrix_global)
+        vt_metrics_global = compute_metrics(tensor_video_to_text_sim(sim_matrix_global))
+        tv_metrics_entity = tensor_text_to_video_metrics(sim_matrix_entity)
+        tv_metrics_action = tensor_text_to_video_metrics(sim_matrix_action)
     else:
-        logger.info("sim matrix size: {}, {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
-        tv_metrics = compute_metrics(sim_matrix)
-        vt_metrics = compute_metrics(sim_matrix.T)
-        logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
+        logger.info("global/entity/action sim matrix size: {}, {}".format(sim_matrix_global.shape[0], sim_matrix_global.shape[1]))
+        tv_metrics_global = compute_metrics(sim_matrix_global)
+        vt_metrics_global = compute_metrics(sim_matrix_global.T)
+        tv_metrics_entity = compute_metrics(sim_matrix_entity)
+        tv_metrics_action = compute_metrics(sim_matrix_action)
+        logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix_global), len(sim_matrix_global[0])))
 
-    logger.info("Text-to-Video:")
+    logger.info("Branch Text-to-Video:")
+    logger.info('\tGlobal >>> R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}'.
+                format(tv_metrics_global['R1'], tv_metrics_global['R5'], tv_metrics_global['R10']))
+    logger.info('\tEntity >>> R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}'.
+                format(tv_metrics_entity['R1'], tv_metrics_entity['R5'], tv_metrics_entity['R10']))
+    logger.info('\tAction >>> R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}'.
+                format(tv_metrics_action['R1'], tv_metrics_action['R5'], tv_metrics_action['R10']))
+
+    if not args.use_entity_branch:
+        sim_matrix_entity = np.zeros_like(sim_matrix_global)
+    if not args.use_action_branch:
+        sim_matrix_action = np.zeros_like(sim_matrix_global)
+
+    fusion_result = search_fusion_weights(
+        sim_matrix_global,
+        sim_matrix_entity,
+        sim_matrix_action,
+        val_labels=None,
+        step=args.fusion_grid_step,
+    )
+    best_weights = fusion_result["best_weights"]
+    sim_matrix_fused = fusion_result["best_sim_matrix"]
+
+    if multi_sentence_:
+        tv_metrics_fused = tensor_text_to_video_metrics(sim_matrix_fused)
+        vt_metrics_fused = compute_metrics(tensor_video_to_text_sim(sim_matrix_fused))
+    else:
+        tv_metrics_fused = compute_metrics(sim_matrix_fused)
+        vt_metrics_fused = compute_metrics(sim_matrix_fused.T)
+
+    logger.info("Fixed-weight Fusion:")
+    logger.info('\tBest Weights (R@1 first): wg={:.2f}, we={:.2f}, wa={:.2f}'.format(
+        best_weights["w_g"], best_weights["w_e"], best_weights["w_a"]))
     logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
-                format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
-    logger.info("Video-to-Text:")
+                format(tv_metrics_fused['R1'], tv_metrics_fused['R5'], tv_metrics_fused['R10'], tv_metrics_fused['MR'], tv_metrics_fused['MeanR']))
+    logger.info("Video-to-Text (Fusion):")
     logger.info('\t>>>  V2T$R@1: {:.1f} - V2T$R@5: {:.1f} - V2T$R@10: {:.1f} - V2T$Median R: {:.1f} - V2T$Mean R: {:.1f}'.
-                format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
+                format(vt_metrics_fused['R1'], vt_metrics_fused['R5'], vt_metrics_fused['R10'], vt_metrics_fused['MR'], vt_metrics_fused['MeanR']))
+    logger.info("Eval fallback rate: entity={:.4f}, action={:.4f}".format(
+        eval_entity_fallback / max(eval_batch_count, 1),
+        eval_action_fallback / max(eval_batch_count, 1),
+    ))
 
-    R1 = tv_metrics['R1']
+    R1 = tv_metrics_fused['R1']
     return R1
 
 def main():
@@ -526,12 +722,21 @@ def main():
     # train and eval
     ## ####################################
     if args.do_train:
+        train_loader_build_start = time.time()
+        if args.local_rank == 0:
+            logger.info("Building train dataloader...")
         train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
+        if args.local_rank == 0:
+            logger.info("Train dataloader ready in %.2fs", time.time() - train_loader_build_start)
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
 
         coef_lr = args.coef_lr
+        if args.local_rank == 0:
+            logger.info("Preparing optimizer/DDP...")
         optimizer, scheduler, model = prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, args.local_rank, coef_lr=coef_lr)
+        if args.local_rank == 0:
+            logger.info("Optimizer/DDP ready")
 
         if args.local_rank == 0:
             logger.info("***** Running training *****")

@@ -3,9 +3,11 @@ from __future__ import division
 from __future__ import print_function
 
 import logging
+import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from modules.until_module import PreTrainedModel, AllGather, CrossEn
 from modules.module_cross import CrossModel, CrossConfig, Transformer as TransformerClip
@@ -244,13 +246,275 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.loss_fct = CrossEn()
 
+        self.use_entity_branch = True
+        self.use_action_branch = True
+        self.lambda_entity = 0.3
+        self.lambda_action = 0.3
+        if hasattr(task_config, "use_entity_branch"):
+            self.use_entity_branch = task_config.use_entity_branch
+        if hasattr(task_config, "use_action_branch"):
+            self.use_action_branch = task_config.use_action_branch
+        if hasattr(task_config, "lambda_entity"):
+            self.lambda_entity = float(task_config.lambda_entity)
+        if hasattr(task_config, "lambda_action"):
+            self.lambda_action = float(task_config.lambda_action)
+
+        self.entity_word_pro_num = 28
+        self.entity_patch_num = 12
+        if hasattr(task_config, "entity_word_pro_num"):
+            self.entity_word_pro_num = int(task_config.entity_word_pro_num)
+        if hasattr(task_config, "entity_patch_num"):
+            self.entity_patch_num = int(task_config.entity_patch_num)
+        if self.entity_patch_num < 2:
+            self.entity_patch_num = 2
+
+        self.entity_word_prototype_weight = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, self.entity_word_pro_num),
+            nn.ReLU(inplace=True),
+        )
+        self.entity_patch_prototype_weight = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, max(self.entity_patch_num - 1, 1)),
+            nn.ReLU(inplace=True),
+        )
+
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None):
+    def _safe_logit_scale(self):
+        logit_scale_param = torch.clamp(self.clip.logit_scale, max=math.log(100.0))
+        return logit_scale_param.exp()
+
+    def _safe_l2_normalize(self, tensor, dim=-1, eps=1e-6):
+        denom = torch.clamp(tensor.norm(dim=dim, keepdim=True), min=eps)
+        return tensor / denom
+
+    def _mean_pool_text_embed(self, sequence_output, attention_mask=None):
+        """
+        Input:
+            sequence_output: [B, 1, D] or [B, L, D]
+            attention_mask: [B, L] or None
+        Output:
+            text_embed: [B, D]
+        """
+        if sequence_output.dim() == 3 and sequence_output.size(1) == 1:
+            text_embed = sequence_output.squeeze(1)
+        else:
+            if attention_mask is None:
+                text_embed = sequence_output.mean(dim=1)
+            else:
+                attention_mask_un = attention_mask.to(dtype=torch.float).unsqueeze(-1)
+                denom = torch.sum(attention_mask_un, dim=1, dtype=torch.float)
+                denom[denom == 0.] = 1.
+                text_embed = torch.sum(sequence_output * attention_mask_un, dim=1) / denom
+        text_embed = self._safe_l2_normalize(text_embed)
+        return text_embed
+
+    def _pool_entity_video_embed(self, visual_output, video_mask):
+        """
+        A1 entity-video branch (simplified single vector).
+
+        Input:
+            visual_output: [B, T, D]
+            video_mask: [B, T]
+        Output:
+            entity_video_embed: [B, D]
+
+        Notes:
+            - A1 uses mean pooling over valid frames as an entity approximation.
+            - Future upgrade path: replace this with K entity prototypes from patch/token features.
+        """
+        entity_video_embed = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+        entity_video_embed = self._safe_l2_normalize(entity_video_embed)
+        return entity_video_embed
+
+    def _pool_action_video_embed(self, visual_output, video_mask):
+        """
+        A1 action-video branch (simplified temporal dynamics).
+
+        Input:
+            visual_output: [B, T, D]
+            video_mask: [B, T]
+        Output:
+            action_video_embed: [B, D]
+
+        Fallback logic:
+            - Primary: adjacent frame difference features + masked mean pooling.
+            - Fallback: if no valid diff frames exist, fallback to global mean pooled visual embedding.
+
+        Notes:
+            - No tracking/tube/optical-flow in A1.
+            - Future upgrade path: entity-based temporal prototype dynamics.
+        """
+        if visual_output.size(1) <= 1:
+            fallback_embed = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+            return self._safe_l2_normalize(fallback_embed)
+
+        diff_feat = visual_output[:, 1:, :] - visual_output[:, :-1, :]
+        diff_mask = (video_mask[:, 1:] * video_mask[:, :-1]).to(dtype=torch.float)
+        diff_mask_un = diff_mask.unsqueeze(-1)
+
+        diff_sum = torch.sum(diff_feat * diff_mask_un, dim=1)
+        diff_cnt = torch.sum(diff_mask_un, dim=1, dtype=torch.float)
+
+        fallback_embed = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+        action_video_embed = diff_sum / torch.clamp(diff_cnt, min=1.0)
+
+        valid = (diff_cnt.squeeze(-1) > 0).to(dtype=action_video_embed.dtype).unsqueeze(-1)
+        action_video_embed = action_video_embed * valid + fallback_embed * (1.0 - valid)
+        action_video_embed = self._safe_l2_normalize(action_video_embed)
+        return action_video_embed
+
+    def _branch_similarity_logits(self, text_embed, video_embed):
+        """
+        Input:
+            text_embed: [B_t, D]
+            video_embed: [B_v, D]
+        Output:
+            logits: [B_t, B_v]
+        """
+        if self.training:
+            text_embed = allgather(text_embed, self.task_config)
+            video_embed = allgather(video_embed, self.task_config)
+            torch.distributed.barrier()
+
+        logit_scale = self._safe_logit_scale()
+        return logit_scale * torch.matmul(text_embed, video_embed.t())
+
+    def get_entity_text_word_prototypes(self, input_ids, attention_mask, shaped=False):
+        if shaped is False:
+            input_ids = input_ids.view(-1, input_ids.shape[-1])
+            attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
+
+        _, hidden = self.clip.encode_text(input_ids, return_hidden=True)
+        hidden = hidden.float()
+
+        token_mask = attention_mask.to(dtype=hidden.dtype).unsqueeze(-1)
+        hidden = hidden * token_mask
+
+        word_weights = self.entity_word_prototype_weight(hidden) * token_mask
+        text_word_proto = torch.einsum("bld,blp->bpd", hidden, word_weights)
+        text_word_proto = F.normalize(text_word_proto, p=2, dim=-1)
+        return text_word_proto
+
+    def get_entity_video_patch_prototypes(self, visual_tokens):
+        cls_tokens = visual_tokens[:, :, 0, :]
+        patch_tokens = visual_tokens[:, :, 1:, :]
+
+        bsz, frame_len, patch_len, feat_dim = patch_tokens.shape
+        patch_tokens_flat = patch_tokens.reshape(bsz * frame_len, patch_len, feat_dim)
+        patch_weights = self.entity_patch_prototype_weight(patch_tokens_flat)
+        patch_proto = torch.einsum("bnd,bnk->bkd", patch_tokens_flat, patch_weights)
+
+        patch_proto = patch_proto.reshape(bsz, frame_len, -1, feat_dim)
+        frame_proto = torch.cat((cls_tokens.unsqueeze(2), patch_proto), dim=2)
+        frame_proto = F.normalize(frame_proto, p=2, dim=-1)
+        return frame_proto
+
+    def _entity_prototype_similarity_logits(self, text_word_proto, video_patch_proto, video_mask):
+        text_word_proto = text_word_proto.contiguous()
+        video_patch_proto = video_patch_proto.contiguous()
+        video_mask = video_mask.contiguous()
+        if self.training:
+            text_word_proto = allgather(text_word_proto, self.task_config)
+            video_patch_proto = allgather(video_patch_proto, self.task_config)
+            video_mask = allgather(video_mask, self.task_config)
+            torch.distributed.barrier()
+
+        sim = torch.einsum("aid,bfjd->abfij", text_word_proto, video_patch_proto)
+        sim = sim.max(dim=3)[0]
+
+        frame_mask = video_mask.to(dtype=torch.bool).unsqueeze(0).unsqueeze(-1)
+        sim = sim.masked_fill(~frame_mask, float("-inf"))
+        sim = sim.max(dim=2)[0]
+        sim[torch.isinf(sim)] = 0.0
+
+        logits = sim.sum(dim=-1) / max(float(self.entity_patch_num), 1.0)
+        logit_scale = self._safe_logit_scale()
+        return logit_scale * logits
+
+    def get_multi_branch_similarity_logits(
+            self,
+            sequence_output_global,
+            sequence_output_entity,
+            sequence_output_action,
+            visual_output,
+            attention_mask_global,
+            attention_mask_entity,
+            attention_mask_action,
+            video_mask,
+            entity_word_proto=None,
+            entity_video_patch_proto=None,
+            loose_type=False,
+    ):
+        """
+        Input:
+            sequence_output_global/entity/action: [B, 1, D]
+            visual_output: [B, T, D]
+            attention_mask_*: [B, L]
+            video_mask: [B, T]
+        Output:
+            logits_global, logits_entity, logits_action: each [B, B]
+        """
+        logits_global, *_ = self.get_similarity_logits(
+            sequence_output_global,
+            visual_output,
+            attention_mask_global,
+            video_mask,
+            shaped=True,
+            loose_type=loose_type,
+        )
+
+        text_entity_embed = self._mean_pool_text_embed(sequence_output_entity, attention_mask_entity)
+        text_action_embed = self._mean_pool_text_embed(sequence_output_action, attention_mask_action)
+        video_action_embed = self._pool_action_video_embed(visual_output, video_mask)
+
+        if entity_word_proto is not None and entity_video_patch_proto is not None:
+            logits_entity = self._entity_prototype_similarity_logits(entity_word_proto, entity_video_patch_proto, video_mask)
+        else:
+            video_entity_embed = self._pool_entity_video_embed(visual_output, video_mask)
+            logits_entity = self._branch_similarity_logits(text_entity_embed, video_entity_embed)
+        logits_action = self._branch_similarity_logits(text_action_embed, video_action_embed)
+        return logits_global, logits_entity, logits_action
+
+    def forward(
+            self,
+            input_ids,
+            token_type_ids,
+            attention_mask,
+            video,
+            video_mask=None,
+            entity_input_ids=None,
+            entity_token_type_ids=None,
+            entity_attention_mask=None,
+            action_input_ids=None,
+            action_token_type_ids=None,
+            action_attention_mask=None,
+    ):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
         attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
         video_mask = video_mask.view(-1, video_mask.shape[-1])
+
+        if entity_input_ids is None:
+            entity_input_ids = input_ids
+            entity_token_type_ids = token_type_ids
+            entity_attention_mask = attention_mask
+        else:
+            entity_input_ids = entity_input_ids.view(-1, entity_input_ids.shape[-1])
+            entity_token_type_ids = entity_token_type_ids.view(-1, entity_token_type_ids.shape[-1])
+            entity_attention_mask = entity_attention_mask.view(-1, entity_attention_mask.shape[-1])
+
+        if action_input_ids is None:
+            action_input_ids = input_ids
+            action_token_type_ids = token_type_ids
+            action_attention_mask = attention_mask
+        else:
+            action_input_ids = action_input_ids.view(-1, action_input_ids.shape[-1])
+            action_token_type_ids = action_token_type_ids.view(-1, action_token_type_ids.shape[-1])
+            action_attention_mask = action_attention_mask.view(-1, action_attention_mask.shape[-1])
 
         # T x 3 x H x W
         video = torch.as_tensor(video).float()
@@ -258,19 +522,73 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         video = video.view(b * pair * bs * ts, channel, h, w)
         video_frame = bs * ts
 
-        sequence_output, visual_output = self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
-                                                                         video, video_mask, shaped=True, video_frame=video_frame)
+        sequence_output, visual_output, visual_tokens = self.get_sequence_visual_output(
+            input_ids,
+            token_type_ids,
+            attention_mask,
+            video,
+            video_mask,
+            shaped=True,
+            video_frame=video_frame,
+            return_hidden_visual=True,
+        )
+        entity_sequence_output = self.get_sequence_output(
+            entity_input_ids,
+            entity_token_type_ids,
+            entity_attention_mask,
+            shaped=True,
+        )
+        action_sequence_output = self.get_sequence_output(
+            action_input_ids,
+            action_token_type_ids,
+            action_attention_mask,
+            shaped=True,
+        )
+
+        entity_word_proto = self.get_entity_text_word_prototypes(
+            entity_input_ids,
+            entity_attention_mask,
+            shaped=True,
+        )
+        entity_video_patch_proto = self.get_entity_video_patch_prototypes(visual_tokens)
 
         if self.training:
-            loss = 0.
-            sim_matrix, *_tmp = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
-                                                    shaped=True, loose_type=self.loose_type)
-            sim_loss1 = self.loss_fct(sim_matrix)
-            sim_loss2 = self.loss_fct(sim_matrix.T)
-            sim_loss = (sim_loss1 + sim_loss2) / 2
-            loss += sim_loss
+            logits_global, logits_entity, logits_action = self.get_multi_branch_similarity_logits(
+                sequence_output,
+                entity_sequence_output,
+                action_sequence_output,
+                visual_output,
+                attention_mask,
+                entity_attention_mask,
+                action_attention_mask,
+                video_mask,
+                entity_word_proto=entity_word_proto,
+                entity_video_patch_proto=entity_video_patch_proto,
+                loose_type=self.loose_type,
+            )
 
-            return loss
+            loss_global = (self.loss_fct(logits_global) + self.loss_fct(logits_global.T)) / 2
+
+            if self.use_entity_branch:
+                loss_entity = (self.loss_fct(logits_entity) + self.loss_fct(logits_entity.T)) / 2
+            else:
+                loss_entity = torch.zeros_like(loss_global)
+
+            if self.use_action_branch:
+                loss_action = (self.loss_fct(logits_action) + self.loss_fct(logits_action.T)) / 2
+            else:
+                loss_action = torch.zeros_like(loss_global)
+
+            total_loss = loss_global + self.lambda_entity * loss_entity + self.lambda_action * loss_action
+            return {
+                "loss": total_loss,
+                "loss_global": loss_global.detach(),
+                "loss_entity": loss_entity.detach(),
+                "loss_action": loss_action.detach(),
+                "score_global_mean": logits_global.mean().detach(),
+                "score_entity_mean": logits_entity.mean().detach(),
+                "score_action_mean": logits_action.mean().detach(),
+            }
         else:
             return None
 
@@ -286,7 +604,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         return sequence_hidden
 
-    def get_visual_output(self, video, video_mask, shaped=False, video_frame=-1):
+    def get_visual_output(self, video, video_mask, shaped=False, video_frame=-1, return_hidden_visual=False):
         if shaped is False:
             video_mask = video_mask.view(-1, video_mask.shape[-1])
             video = torch.as_tensor(video).float()
@@ -295,12 +613,19 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video_frame = bs * ts
 
         bs_pair = video_mask.size(0)
-        visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()
-        visual_hidden = visual_hidden.view(bs_pair, -1, visual_hidden.size(-1))
+        visual_cls, visual_hidden = self.clip.encode_image(video, return_hidden=True, video_frame=video_frame)
+        visual_cls = visual_cls.float()
+        visual_hidden = visual_hidden.float()
 
-        return visual_hidden
+        visual_output = visual_cls.view(bs_pair, -1, visual_cls.size(-1))
+        if not return_hidden_visual:
+            return visual_output
 
-    def get_sequence_visual_output(self, input_ids, token_type_ids, attention_mask, video, video_mask, shaped=False, video_frame=-1):
+        token_num = visual_hidden.size(1)
+        visual_tokens = visual_hidden.view(bs_pair, -1, token_num, visual_hidden.size(-1))
+        return visual_output, visual_tokens
+
+    def get_sequence_visual_output(self, input_ids, token_type_ids, attention_mask, video, video_mask, shaped=False, video_frame=-1, return_hidden_visual=False):
         if shaped is False:
             input_ids = input_ids.view(-1, input_ids.shape[-1])
             token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
@@ -313,8 +638,18 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video_frame = bs * ts
 
         sequence_output = self.get_sequence_output(input_ids, token_type_ids, attention_mask, shaped=True)
-        visual_output = self.get_visual_output(video, video_mask, shaped=True, video_frame=video_frame)
+        visual_ret = self.get_visual_output(
+            video,
+            video_mask,
+            shaped=True,
+            video_frame=video_frame,
+            return_hidden_visual=return_hidden_visual,
+        )
+        if return_hidden_visual:
+            visual_output, visual_tokens = visual_ret
+            return sequence_output, visual_output, visual_tokens
 
+        visual_output = visual_ret
         return sequence_output, visual_output
 
     def _get_cross_output(self, sequence_output, visual_output, attention_mask, video_mask):
@@ -389,14 +724,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sequence_output = allgather(sequence_output, self.task_config)
             torch.distributed.barrier()
 
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        visual_output = self._safe_l2_normalize(visual_output)
         visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        visual_output = self._safe_l2_normalize(visual_output)
 
         sequence_output = sequence_output.squeeze(1)
-        sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
+        sequence_output = self._safe_l2_normalize(sequence_output)
 
-        logit_scale = self.clip.logit_scale.exp()
+        logit_scale = self._safe_logit_scale()
         retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
         return retrieve_logits
 

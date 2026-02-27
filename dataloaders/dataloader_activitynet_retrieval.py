@@ -9,6 +9,7 @@ import numpy as np
 import json
 import math
 from dataloaders.rawvideo_util import RawVideoExtractor
+from dataloaders.text_branch_utils import load_text_branch_records, get_text_branches_from_records
 
 class ActivityNet_DataLoader(Dataset):
     def __init__(
@@ -23,6 +24,7 @@ class ActivityNet_DataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+                branch_cache_path="",
     ):
         self.data_path = data_path
         self.features_path = features_path
@@ -36,6 +38,8 @@ class ActivityNet_DataLoader(Dataset):
         # 0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
+
+        self.branch_records = load_text_branch_records(cache_path=branch_cache_path, cache_name="activity_records")
 
         self.subset = subset
         assert self.subset in ["train", "val"]
@@ -161,6 +165,31 @@ class ActivityNet_DataLoader(Dataset):
 
         return pairs_text, pairs_mask, pairs_segment, starts, ends
 
+    def _get_text_from_string(self, sentence):
+        pairs_text = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_mask = np.zeros((1, self.max_words), dtype=np.long)
+        pairs_segment = np.zeros((1, self.max_words), dtype=np.long)
+
+        words = self.tokenizer.tokenize(sentence)
+        words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
+        total_length_with_CLS = self.max_words - 1
+        if len(words) > total_length_with_CLS:
+            words = words[:total_length_with_CLS]
+        words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(words)
+        input_mask = [1] * len(input_ids)
+        segment_ids = [0] * len(input_ids)
+        while len(input_ids) < self.max_words:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+
+        pairs_text[0] = np.array(input_ids)
+        pairs_mask[0] = np.array(input_mask)
+        pairs_segment[0] = np.array(segment_ids)
+        return pairs_text, pairs_mask, pairs_segment
+
     def _get_rawvideo(self, idx, s, e):
         video_mask = np.zeros((len(s), self.max_frames), dtype=np.long)
         max_video_length = [0] * len(s)
@@ -222,6 +251,18 @@ class ActivityNet_DataLoader(Dataset):
         pseudo_video_id, sub_id = self.iter2video_pairs_dict[feature_idx]
         idx = self.video_id2idx_dict[pseudo_video_id]
 
+        sentence = self.pseudo_caption_dict[pseudo_video_id]['text'][sub_id]
+        text_branches = get_text_branches_from_records(self.branch_records, feature_idx, sentence, require_match=True)
         pairs_text, pairs_mask, pairs_segment, starts, ends = self._get_text(pseudo_video_id, sub_id)
+        entity_text, entity_mask, entity_segment = self._get_text_from_string(text_branches["entity_text"])
+        action_text, action_mask, action_segment = self._get_text_from_string(text_branches["action_text"])
         video, video_mask = self._get_rawvideo(self.video_id_list[idx], starts, ends)
-        return pairs_text, pairs_mask, pairs_segment, video, video_mask
+        entity_fallback = np.array([text_branches["entity_fallback"]], dtype=np.long)
+        action_fallback = np.array([text_branches["action_fallback"]], dtype=np.long)
+        return (
+            pairs_text, pairs_mask, pairs_segment,
+            entity_text, entity_mask, entity_segment,
+            action_text, action_mask, action_segment,
+            entity_fallback, action_fallback,
+            video, video_mask,
+        )

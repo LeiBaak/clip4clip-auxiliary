@@ -7,6 +7,16 @@ from dataloaders.dataloader_lsmdc_retrieval import LSMDC_DataLoader
 from dataloaders.dataloader_activitynet_retrieval import ActivityNet_DataLoader
 from dataloaders.dataloader_didemo_retrieval import DiDeMo_DataLoader
 
+
+def _branch_cache_path(args, datatype, subset):
+    base = getattr(args, "text_branch_cache_path", "")
+    if isinstance(base, str) and base.strip():
+        root = base.strip()
+        if root.endswith(".json"):
+            return root
+        return "{}/{}_{}_text_branches.json".format(root.rstrip("/"), datatype, subset)
+    return ""
+
 def dataloader_msrvtt_train(args, tokenizer):
     msrvtt_dataset = MSRVTT_TrainDataLoader(
         csv_path=args.train_csv,
@@ -19,6 +29,7 @@ def dataloader_msrvtt_train(args, tokenizer):
         unfold_sentences=args.expand_msrvtt_sentences,
         frame_order=args.train_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "msrvtt", "train"),
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(msrvtt_dataset)
@@ -44,6 +55,7 @@ def dataloader_msrvtt_test(args, tokenizer, subset="test"):
         max_frames=args.max_frames,
         frame_order=args.eval_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "msrvtt", subset),
     )
     dataloader_msrvtt = DataLoader(
         msrvtt_testset,
@@ -66,6 +78,7 @@ def dataloader_msvd_train(args, tokenizer):
         max_frames=args.max_frames,
         frame_order=args.train_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "msvd", "train") or getattr(args, "msvd_branch_cache_path", ""),
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(msvd_dataset)
@@ -92,6 +105,7 @@ def dataloader_msvd_test(args, tokenizer, subset="test"):
         max_frames=args.max_frames,
         frame_order=args.eval_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "msvd", subset) or getattr(args, "msvd_branch_cache_path", ""),
     )
     dataloader_msrvtt = DataLoader(
         msvd_testset,
@@ -114,6 +128,7 @@ def dataloader_lsmdc_train(args, tokenizer):
         max_frames=args.max_frames,
         frame_order=args.train_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "lsmdc", "train"),
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(lsmdc_dataset)
@@ -140,6 +155,7 @@ def dataloader_lsmdc_test(args, tokenizer, subset="test"):
         max_frames=args.max_frames,
         frame_order=args.eval_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "lsmdc", subset),
     )
     dataloader_msrvtt = DataLoader(
         lsmdc_testset,
@@ -162,6 +178,7 @@ def dataloader_activity_train(args, tokenizer):
         max_frames=args.max_frames,
         frame_order=args.train_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "activity", "train"),
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(activity_dataset)
@@ -188,6 +205,7 @@ def dataloader_activity_test(args, tokenizer, subset="test"):
         max_frames=args.max_frames,
         frame_order=args.eval_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "activity", subset),
     )
     dataloader_msrvtt = DataLoader(
         activity_testset,
@@ -210,6 +228,7 @@ def dataloader_didemo_train(args, tokenizer):
         max_frames=args.max_frames,
         frame_order=args.train_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "didemo", "train"),
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(didemo_dataset)
@@ -236,6 +255,7 @@ def dataloader_didemo_test(args, tokenizer, subset="test"):
         max_frames=args.max_frames,
         frame_order=args.eval_frame_order,
         slice_framepos=args.slice_framepos,
+        branch_cache_path=_branch_cache_path(args, "didemo", subset),
     )
     dataloader_didemo = DataLoader(
         didemo_testset,

@@ -1,11 +1,22 @@
 export CUDA_VISIBLE_DEVICES=2,3,4,5  # 指定使用的GPU编号，如 0 或 1,2
 DATA_PATH=/data/jzw/msvd
+CHECK_BRANCH_ALIGNMENT=${CHECK_BRANCH_ALIGNMENT:-1}
+
+if [ "${CHECK_BRANCH_ALIGNMENT}" = "1" ]; then
+	echo "[startup_msvd] verifying ordered branch cache alignment..."
+	python -m dataloaders.verify_msvd_ordered_text_branches \
+		--data_path ${DATA_PATH} \
+		--cache_dir ${DATA_PATH} \
+		--subsets train,val,test || exit 1
+fi
+
 python -m torch.distributed.launch --nproc_per_node=4 --master_port=29501 \
 main_task_retrieval.py --do_train --num_thread_reader=8 \
 --epochs=5 --batch_size=128 --n_display=50 \
 --data_path ${DATA_PATH} \
 --features_path ${DATA_PATH}/compressed \
 --output_dir ckpts/msvd \
+--text_branch_cache_path ${DATA_PATH} \
 --lr 1e-4 --max_words 32 --max_frames 12 --batch_size_val 16 \
 --datatype msvd \
 --feature_framerate 1 --coef_lr 1e-3 \
