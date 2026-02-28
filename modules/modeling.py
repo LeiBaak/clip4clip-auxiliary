@@ -246,6 +246,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                                        batch_first=True, bidirectional=False, num_layers=1)
 
         self.loss_fct = CrossEn()
+        self.entity_logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
 
         self.use_entity_branch = True
         self.use_action_branch = True
@@ -262,11 +263,26 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.entity_word_pro_num = 28
         self.entity_patch_num = 12
+        self.entity_and_token_id = -1
+        self.entity_single_proto_from_caption_cls = False
+        self.entity_template_cls_proto = False
+        self.entity_template_prefix_ids = []
+        self.entity_template_suffix_ids = []
         self.use_entity_query_attention = True
         if hasattr(task_config, "entity_word_pro_num"):
             self.entity_word_pro_num = int(task_config.entity_word_pro_num)
         if hasattr(task_config, "entity_patch_num"):
             self.entity_patch_num = int(task_config.entity_patch_num)
+        if hasattr(task_config, "entity_and_token_id"):
+            self.entity_and_token_id = int(task_config.entity_and_token_id)
+        if hasattr(task_config, "entity_single_proto_from_caption_cls"):
+            self.entity_single_proto_from_caption_cls = bool(task_config.entity_single_proto_from_caption_cls)
+        if hasattr(task_config, "entity_template_cls_proto"):
+            self.entity_template_cls_proto = bool(task_config.entity_template_cls_proto)
+        if hasattr(task_config, "entity_template_prefix_ids"):
+            self.entity_template_prefix_ids = self._parse_token_id_list(getattr(task_config, "entity_template_prefix_ids"))
+        if hasattr(task_config, "entity_template_suffix_ids"):
+            self.entity_template_suffix_ids = self._parse_token_id_list(getattr(task_config, "entity_template_suffix_ids"))
         if hasattr(task_config, "use_entity_query_attention"):
             self.use_entity_query_attention = bool(task_config.use_entity_query_attention)
         show_log(task_config, "\t use_entity_query_attention(patch-proto): {}".format(self.use_entity_query_attention))
@@ -279,6 +295,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             nn.Linear(embed_dim, self.entity_word_pro_num),
             nn.ReLU(inplace=True),
         )
+        self.entity_single_fuse_weight = nn.Linear(embed_dim * 2, embed_dim)
         self.entity_patch_prototype_weight = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(inplace=True),
@@ -311,9 +328,25 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.apply(self.init_weights)
 
+    def _parse_token_id_list(self, value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [int(v) for v in value]
+        if isinstance(value, str):
+            text = value.strip()
+            if len(text) == 0:
+                return []
+            return [int(v.strip()) for v in text.split(",") if len(v.strip()) > 0]
+        return []
+
     def _safe_logit_scale(self):
         logit_scale_param = torch.clamp(self.clip.logit_scale, max=math.log(100.0))
         return logit_scale_param.exp()
+
+    def _safe_entity_logit_scale(self):
+        entity_logit_scale_param = torch.clamp(self.entity_logit_scale, max=math.log(100.0))
+        return entity_logit_scale_param.exp()
 
     def _safe_l2_normalize(self, tensor, dim=-1, eps=1e-6):
         denom = torch.clamp(tensor.norm(dim=dim, keepdim=True), min=eps)
@@ -411,17 +444,198 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         logit_scale = self._safe_logit_scale()
         return logit_scale * torch.matmul(text_embed, video_embed.t())
 
-    def get_entity_text_word_prototypes(self, input_ids, attention_mask, shaped=False):
+    def get_entity_text_word_prototypes(
+        self,
+        input_ids,
+        attention_mask,
+        action_input_ids=None,
+        action_attention_mask=None,
+        caption_input_ids=None,
+        caption_attention_mask=None,
+        caption_sequence_output=None,
+        shaped=False,
+    ):
         if shaped is False:
             input_ids = input_ids.view(-1, input_ids.shape[-1])
             attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
+            if action_input_ids is not None and action_attention_mask is not None:
+                action_input_ids = action_input_ids.view(-1, action_input_ids.shape[-1])
+                action_attention_mask = action_attention_mask.view(-1, action_attention_mask.shape[-1])
+            if caption_input_ids is not None and caption_attention_mask is not None:
+                caption_input_ids = caption_input_ids.view(-1, caption_input_ids.shape[-1])
+                caption_attention_mask = caption_attention_mask.view(-1, caption_attention_mask.shape[-1])
 
-        _, hidden = self.clip.encode_text(input_ids, return_hidden=True)
-        hidden = hidden.float()
+        batch_size, max_words = input_ids.size(0), input_ids.size(1)
+        device = input_ids.device
+        and_token_id = int(getattr(self, "entity_and_token_id", -1))
+        entity_slots = int(self.entity_word_pro_num)
+        if self.entity_template_cls_proto:
+            entity_slots = min(entity_slots, 4)
+        entity_slots = max(entity_slots, 1)
 
-        word_weights = self.entity_word_prototype_weight(hidden)
-        text_word_proto = torch.einsum("bld,blp->bpd", hidden, word_weights)
-        return text_word_proto
+        def _count_subseq_occurrences(sequence_ids, pattern_ids):
+            seq_len = int(sequence_ids.numel())
+            pat_len = int(pattern_ids.numel())
+            if seq_len <= 0 or pat_len <= 0 or pat_len > seq_len:
+                return 0
+            count = 0
+            max_start = seq_len - pat_len
+            for start in range(max_start + 1):
+                if torch.equal(sequence_ids[start:start + pat_len], pattern_ids):
+                    count += 1
+            return count
+
+        if caption_sequence_output is not None:
+            caption_cls = caption_sequence_output.squeeze(1).float()
+        elif caption_input_ids is not None and caption_attention_mask is not None:
+            caption_cls = self.get_sequence_output(
+                caption_input_ids,
+                torch.zeros_like(caption_input_ids),
+                caption_attention_mask,
+                shaped=True,
+            ).squeeze(1).float()
+        else:
+            caption_cls = self.get_sequence_output(
+                input_ids,
+                torch.zeros_like(input_ids),
+                attention_mask,
+                shaped=True,
+            ).squeeze(1).float()
+
+        segment_sequences = []
+        segment_meta = []
+        segment_score = []
+
+        for batch_index in range(batch_size):
+            valid_len = int(attention_mask[batch_index].sum().item())
+            if valid_len <= 0:
+                valid_ids = input_ids.new_zeros((0,))
+            else:
+                valid_ids = input_ids[batch_index, :valid_len]
+
+            if valid_ids.numel() >= 2:
+                cls_id = int(valid_ids[0].item())
+                sep_id = int(valid_ids[-1].item())
+                content_ids = valid_ids[1:-1]
+            elif valid_ids.numel() == 1:
+                cls_id = int(valid_ids[0].item())
+                sep_id = int(valid_ids[0].item())
+                content_ids = valid_ids.new_zeros((0,))
+            else:
+                cls_id = 0
+                sep_id = 0
+                content_ids = valid_ids
+
+            if action_input_ids is not None and action_attention_mask is not None:
+                action_valid_len = int(action_attention_mask[batch_index].sum().item())
+                if action_valid_len >= 2:
+                    action_content_ids = action_input_ids[batch_index, 1:action_valid_len - 1]
+                else:
+                    action_content_ids = action_input_ids.new_zeros((0,), dtype=action_input_ids.dtype)
+            else:
+                action_content_ids = content_ids
+
+            entity_chunks = []
+            if and_token_id >= 0 and content_ids.numel() > 0:
+                start = 0
+                for token_index in range(content_ids.size(0)):
+                    if int(content_ids[token_index].item()) == and_token_id:
+                        chunk = content_ids[start:token_index]
+                        if chunk.numel() > 0:
+                            entity_chunks.append(chunk)
+                        start = token_index + 1
+                tail_chunk = content_ids[start:]
+                if tail_chunk.numel() > 0:
+                    entity_chunks.append(tail_chunk)
+
+            if len(entity_chunks) == 0:
+                if content_ids.numel() > 0:
+                    entity_chunks = [content_ids]
+                else:
+                    entity_chunks = [input_ids.new_tensor([cls_id], dtype=input_ids.dtype)]
+
+            for chunk in entity_chunks:
+                seg_ids = input_ids.new_zeros((max_words,), dtype=input_ids.dtype)
+                seg_mask = attention_mask.new_zeros((max_words,), dtype=attention_mask.dtype)
+                seg_ids[0] = cls_id
+                seg_mask[0] = 1
+
+                if self.entity_template_cls_proto:
+                    prefix_tensor = chunk.new_tensor(self.entity_template_prefix_ids, dtype=chunk.dtype)
+                    suffix_tensor = chunk.new_tensor(self.entity_template_suffix_ids, dtype=chunk.dtype)
+                    template_content = torch.cat([prefix_tensor, chunk, suffix_tensor], dim=0)
+                    usable_len = min(max_words - 2, int(template_content.numel()))
+                    if usable_len > 0:
+                        seg_ids[1:1 + usable_len] = template_content[:usable_len]
+                        seg_mask[1:1 + usable_len] = 1
+                else:
+                    usable_len = min(max_words - 2, int(chunk.numel()))
+                    if usable_len > 0:
+                        seg_ids[1:1 + usable_len] = chunk[:usable_len]
+                        seg_mask[1:1 + usable_len] = 1
+
+                sep_pos = 1 + usable_len
+                seg_ids[sep_pos] = sep_id
+                seg_mask[sep_pos] = 1
+
+                segment_sequences.append((seg_ids, seg_mask))
+                segment_meta.append(batch_index)
+                segment_score.append(_count_subseq_occurrences(action_content_ids, chunk))
+
+        if len(segment_sequences) == 0:
+            output = torch.zeros(batch_size, entity_slots + 1, self.clip.text_projection.shape[1], device=device, dtype=torch.float)
+            caption_norm = self._safe_l2_normalize(caption_cls, dim=-1)
+            output[:, 0, :] = caption_norm
+            output[:, 1:, :] = caption_norm.unsqueeze(1).expand(-1, entity_slots, -1)
+            output_mask = torch.ones(batch_size, entity_slots + 1, device=device, dtype=torch.float)
+            return output, output_mask
+
+        seg_input_ids = torch.stack([item[0] for item in segment_sequences], dim=0)
+        seg_attention_mask = torch.stack([item[1] for item in segment_sequences], dim=0)
+        seg_embeds = self.get_sequence_output(
+            seg_input_ids,
+            torch.zeros_like(seg_input_ids),
+            seg_attention_mask,
+            shaped=True,
+        ).squeeze(1).float()
+
+        grouped = [[] for _ in range(batch_size)]
+        for seg_index, batch_index in enumerate(segment_meta):
+            grouped[batch_index].append((seg_embeds[seg_index], int(segment_score[seg_index]), seg_index))
+
+        output = torch.zeros(batch_size, entity_slots + 1, seg_embeds.size(-1), device=device, dtype=seg_embeds.dtype)
+        output_mask = torch.ones(batch_size, entity_slots + 1, device=device, dtype=seg_embeds.dtype)
+
+        for batch_index in range(batch_size):
+            entity_list = grouped[batch_index]
+            if len(entity_list) == 0:
+                caption_vec = self._safe_l2_normalize(caption_cls[batch_index:batch_index + 1], dim=-1)
+                output[batch_index, 0:1, :] = caption_vec
+                output[batch_index, 1:, :] = caption_vec.expand(entity_slots, -1)
+                continue
+
+            entity_list = sorted(entity_list, key=lambda item: (-item[1], item[2]))
+            entity_tensor = torch.stack([item[0] for item in entity_list], dim=0)
+
+            caption_vec = self._safe_l2_normalize(caption_cls[batch_index:batch_index + 1], dim=-1)
+            caption_expand = caption_vec.expand(entity_tensor.size(0), -1)
+            fused_input = torch.cat([entity_tensor, caption_expand], dim=-1)
+            entity_tensor = self.entity_single_fuse_weight(fused_input)
+            entity_tensor = self._safe_l2_normalize(entity_tensor, dim=-1)
+
+            if entity_tensor.size(0) >= entity_slots:
+                fixed_entity_tensor = entity_tensor[:entity_slots]
+            else:
+                pad_count = entity_slots - entity_tensor.size(0)
+                rank_len = entity_tensor.size(0)
+                pad_rows = [entity_tensor[(pad_idx % rank_len):(pad_idx % rank_len) + 1] for pad_idx in range(pad_count)]
+                pad_tensor = torch.cat(pad_rows, dim=0)
+                fixed_entity_tensor = torch.cat([entity_tensor, pad_tensor], dim=0)
+
+            output[batch_index, 0:1, :] = caption_vec
+            output[batch_index, 1:, :] = fixed_entity_tensor
+
+        return output, output_mask
 
     def get_entity_video_patch_prototypes(self, visual_tokens):
         cls_tokens = visual_tokens[:, :, 0, :]
@@ -436,12 +650,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         frame_proto = torch.cat((cls_tokens.unsqueeze(2), patch_proto), dim=2)
         return frame_proto
 
-    def _entity_prototype_similarity_logits(self, text_word_proto, video_patch_proto, video_mask):
+    def _entity_prototype_similarity_logits(self, text_word_proto, text_word_proto_mask, video_patch_proto, video_mask):
         text_word_proto = text_word_proto.contiguous()
+        text_word_proto_mask = text_word_proto_mask.contiguous()
         video_patch_proto = video_patch_proto.contiguous()
         video_mask = video_mask.contiguous()
         if self.training:
             text_word_proto = allgather(text_word_proto, self.task_config)
+            text_word_proto_mask = allgather(text_word_proto_mask, self.task_config)
             video_patch_proto = allgather(video_patch_proto, self.task_config)
             video_mask = allgather(video_mask, self.task_config)
             torch.distributed.barrier()
@@ -454,8 +670,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         sim = sim.max(dim=2)[0]
         logits = sim.sum(dim=-1) / max(float(self.entity_patch_num), 1.0)
 
-        logit_scale = self._safe_logit_scale()
-        return logit_scale * logits
+        entity_logit_scale = self._safe_entity_logit_scale()
+        return entity_logit_scale * logits
 
     def get_multi_branch_similarity_logits(
             self,
@@ -468,6 +684,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             attention_mask_action,
             video_mask,
             entity_word_proto=None,
+            entity_word_proto_mask=None,
             entity_video_patch_proto=None,
             loose_type=False,
     ):
@@ -493,8 +710,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         text_action_embed = self._mean_pool_text_embed(sequence_output_action, attention_mask_action)
         video_action_embed = self._pool_action_video_embed(visual_output, video_mask)
 
-        if entity_word_proto is not None and entity_video_patch_proto is not None:
-            logits_entity = self._entity_prototype_similarity_logits(entity_word_proto, entity_video_patch_proto, video_mask)
+        if entity_word_proto is not None and entity_video_patch_proto is not None and entity_word_proto_mask is not None:
+            logits_entity = self._entity_prototype_similarity_logits(entity_word_proto, entity_word_proto_mask, entity_video_patch_proto, video_mask)
         else:
             video_entity_embed = self._pool_entity_video_embed(visual_output, video_mask)
             logits_entity = self._branch_similarity_logits(text_entity_embed, video_entity_embed)
@@ -567,9 +784,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             shaped=True,
         )
 
-        entity_word_proto = self.get_entity_text_word_prototypes(
+        entity_word_proto, entity_word_proto_mask = self.get_entity_text_word_prototypes(
             entity_input_ids,
             entity_attention_mask,
+            action_input_ids=action_input_ids,
+            action_attention_mask=action_attention_mask,
+            caption_input_ids=input_ids,
+            caption_attention_mask=attention_mask,
+            caption_sequence_output=sequence_output,
             shaped=True,
         )
         entity_video_patch_proto = self.get_entity_video_patch_prototypes(visual_tokens)
@@ -585,6 +807,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 action_attention_mask,
                 video_mask,
                 entity_word_proto=entity_word_proto,
+                entity_word_proto_mask=entity_word_proto_mask,
                 entity_video_patch_proto=entity_video_patch_proto,
                 loose_type=self.loose_type,
             )

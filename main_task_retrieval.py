@@ -109,8 +109,11 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--disable_action_branch', action='store_true', help='Disable action branch for ablation.')
     parser.add_argument('--lambda_entity', type=float, default=0.3, help='Loss weight for entity branch.')
     parser.add_argument('--lambda_action', type=float, default=0.3, help='Loss weight for action branch.')
-    parser.add_argument('--entity_word_pro_num', type=int, default=28, help='Number of text word prototypes for entity branch.')
+    parser.add_argument('--entity_word_pro_num', type=int, default=5, help='Number of text word prototypes for entity branch.')
     parser.add_argument('--entity_patch_num', type=int, default=12, help='Number of visual patch prototypes (including CLS) for entity branch.')
+    parser.add_argument('--entity_and_token_id', type=int, default=-1, help='Token id used to split entity text by conjunction "and"; auto-detected when < 0.')
+    parser.add_argument('--entity_single_proto_from_caption_cls', action='store_true', help='Use caption CLS + entity tokens to produce a single entity text prototype via 1-dim word weight.')
+    parser.add_argument('--entity_template_cls_proto', action='store_true', help='Encode each entity as template "This video contains {entity}." and use CLS as one entity proto.')
     parser.add_argument('--disable_entity_query_attention', action='store_true', help='Disable query-attention prototype extraction in entity branch.')
     parser.add_argument('--fusion_grid_step', type=float, default=0.1, help='Grid step for fixed fusion weights.')
     parser.add_argument('--msvd_branch_cache_path', type=str, default='', help='Optional path to offline MSVD text branch cache JSON.')
@@ -397,7 +400,7 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
         input_mask = input_mask.view(-1, input_mask.shape[-1])
         entity_input_mask = entity_input_mask.view(-1, entity_input_mask.shape[-1])
         action_input_mask = action_input_mask.view(-1, action_input_mask.shape[-1])
-        sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto = batch_sequence_output_list[idx1]
+        sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto, entity_word_proto_mask = batch_sequence_output_list[idx1]
         each_row_global = []
         each_row_entity = []
         each_row_action = []
@@ -415,6 +418,7 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
                 action_input_mask,
                 video_mask,
                 entity_word_proto=entity_word_proto,
+                entity_word_proto_mask=entity_word_proto_mask,
                 entity_video_patch_proto=entity_video_patch_proto,
                 loose_type=model.loose_type,
             )
@@ -491,8 +495,16 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 sequence_output = model.get_sequence_output(input_ids, segment_ids, input_mask)
                 entity_sequence_output = model.get_sequence_output(entity_input_ids, entity_segment_ids, entity_input_mask)
                 action_sequence_output = model.get_sequence_output(action_input_ids, action_segment_ids, action_input_mask)
-                entity_word_proto = model.get_entity_text_word_prototypes(entity_input_ids, entity_input_mask)
-                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto))
+                entity_word_proto, entity_word_proto_mask = model.get_entity_text_word_prototypes(
+                    entity_input_ids,
+                    entity_input_mask,
+                    action_input_ids=action_input_ids,
+                    action_attention_mask=action_input_mask,
+                    caption_input_ids=input_ids,
+                    caption_attention_mask=input_mask,
+                    caption_sequence_output=sequence_output,
+                )
+                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto, entity_word_proto_mask))
                 batch_list_t.append((input_mask, entity_input_mask, action_input_mask,))
 
                 s_, e_ = total_video_num, total_video_num + b
@@ -517,10 +529,18 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 )
                 entity_sequence_output = model.get_sequence_output(entity_input_ids, entity_segment_ids, entity_input_mask)
                 action_sequence_output = model.get_sequence_output(action_input_ids, action_segment_ids, action_input_mask)
-                entity_word_proto = model.get_entity_text_word_prototypes(entity_input_ids, entity_input_mask)
+                entity_word_proto, entity_word_proto_mask = model.get_entity_text_word_prototypes(
+                    entity_input_ids,
+                    entity_input_mask,
+                    action_input_ids=action_input_ids,
+                    action_attention_mask=action_input_mask,
+                    caption_input_ids=input_ids,
+                    caption_attention_mask=input_mask,
+                    caption_sequence_output=sequence_output,
+                )
                 entity_video_patch_proto = model.get_entity_video_patch_prototypes(visual_tokens)
 
-                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto))
+                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto, entity_word_proto_mask))
                 batch_list_t.append((input_mask, entity_input_mask, action_input_mask,))
 
                 batch_visual_output_list.append((visual_output, entity_video_patch_proto))
@@ -667,6 +687,26 @@ def main():
     device, n_gpu = init_device(args, args.local_rank)
 
     tokenizer = ClipTokenizer()
+    if getattr(args, "entity_and_token_id", -1) < 0:
+        and_tokens = tokenizer.tokenize("and")
+        if len(and_tokens) > 0:
+            and_ids = tokenizer.convert_tokens_to_ids([and_tokens[0]])
+            if len(and_ids) == 1:
+                args.entity_and_token_id = int(and_ids[0])
+            else:
+                args.entity_and_token_id = -1
+        else:
+            args.entity_and_token_id = -1
+    if args.local_rank == 0:
+        logger.info("Entity split token id (and): %d", int(getattr(args, "entity_and_token_id", -1)))
+
+    template_prefix_tokens = tokenizer.tokenize("this video contains")
+    template_suffix_tokens = tokenizer.tokenize(".")
+    args.entity_template_prefix_ids = tokenizer.convert_tokens_to_ids(template_prefix_tokens)
+    args.entity_template_suffix_ids = tokenizer.convert_tokens_to_ids(template_suffix_tokens)
+    if args.local_rank == 0:
+        logger.info("Entity template token ids: prefix_len=%d, suffix_len=%d",
+                    len(args.entity_template_prefix_ids), len(args.entity_template_suffix_ids))
 
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
