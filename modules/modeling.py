@@ -14,6 +14,7 @@ from modules.module_cross import CrossModel, CrossConfig, Transformer as Transfo
 
 from modules.module_clip import CLIP, convert_weights
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from ProST.decoder import Event_decoder, Frame_decoder
 
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
@@ -261,10 +262,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.entity_word_pro_num = 28
         self.entity_patch_num = 12
+        self.use_entity_query_attention = True
         if hasattr(task_config, "entity_word_pro_num"):
             self.entity_word_pro_num = int(task_config.entity_word_pro_num)
         if hasattr(task_config, "entity_patch_num"):
             self.entity_patch_num = int(task_config.entity_patch_num)
+        if hasattr(task_config, "use_entity_query_attention"):
+            self.use_entity_query_attention = bool(task_config.use_entity_query_attention)
+        show_log(task_config, "\t use_entity_query_attention(patch-proto): {}".format(self.use_entity_query_attention))
         if self.entity_patch_num < 2:
             self.entity_patch_num = 2
 
@@ -279,6 +284,29 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             nn.ReLU(inplace=True),
             nn.Linear(embed_dim, max(self.entity_patch_num - 1, 1)),
             nn.ReLU(inplace=True),
+        )
+
+        self.entity_event_layer_num = int(getattr(task_config, "event_layer_num", 1))
+        self.entity_max_vfea = int(getattr(task_config, "max_vfea", self.task_config.max_frames))
+        self.entity_frame_decoder = Frame_decoder(
+            num_attris=self.task_config.max_frames,
+            layers=self.entity_event_layer_num,
+            heads=1,
+            dim_ftr=embed_dim,
+            pos_emb=False,
+            length=1,
+            dim_feedforward=embed_dim,
+            without_init=False,
+        )
+        self.entity_event_decoder = Event_decoder(
+            num_attris=self.entity_max_vfea,
+            layers=self.entity_event_layer_num,
+            heads=1,
+            dim_ftr=embed_dim,
+            pos_emb=False,
+            length=1,
+            dim_feedforward=embed_dim,
+            without_init=False,
         )
 
         self.apply(self.init_weights)
@@ -391,26 +419,21 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         _, hidden = self.clip.encode_text(input_ids, return_hidden=True)
         hidden = hidden.float()
 
-        token_mask = attention_mask.to(dtype=hidden.dtype).unsqueeze(-1)
-        hidden = hidden * token_mask
-
-        word_weights = self.entity_word_prototype_weight(hidden) * token_mask
+        word_weights = self.entity_word_prototype_weight(hidden)
         text_word_proto = torch.einsum("bld,blp->bpd", hidden, word_weights)
-        text_word_proto = F.normalize(text_word_proto, p=2, dim=-1)
         return text_word_proto
 
     def get_entity_video_patch_prototypes(self, visual_tokens):
         cls_tokens = visual_tokens[:, :, 0, :]
-        patch_tokens = visual_tokens[:, :, 1:, :]
 
-        bsz, frame_len, patch_len, feat_dim = patch_tokens.shape
-        patch_tokens_flat = patch_tokens.reshape(bsz * frame_len, patch_len, feat_dim)
-        patch_weights = self.entity_patch_prototype_weight(patch_tokens_flat)
-        patch_proto = torch.einsum("bnd,bnk->bkd", patch_tokens_flat, patch_weights)
+        bsz, frame_len, token_len, feat_dim = visual_tokens.shape
+        tokens_flat = visual_tokens.reshape(bsz * frame_len, token_len, feat_dim)
+
+        patch_weights = self.entity_patch_prototype_weight(tokens_flat)
+        patch_proto = torch.einsum("bnd,bnk->bkd", tokens_flat, patch_weights)
 
         patch_proto = patch_proto.reshape(bsz, frame_len, -1, feat_dim)
         frame_proto = torch.cat((cls_tokens.unsqueeze(2), patch_proto), dim=2)
-        frame_proto = F.normalize(frame_proto, p=2, dim=-1)
         return frame_proto
 
     def _entity_prototype_similarity_logits(self, text_word_proto, video_patch_proto, video_mask):
@@ -423,15 +446,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video_mask = allgather(video_mask, self.task_config)
             torch.distributed.barrier()
 
+        text_word_proto = F.normalize(text_word_proto, p=2, dim=2)
+        video_patch_proto = F.normalize(video_patch_proto, p=2, dim=3)
+
         sim = torch.einsum("aid,bfjd->abfij", text_word_proto, video_patch_proto)
         sim = sim.max(dim=3)[0]
-
-        frame_mask = video_mask.to(dtype=torch.bool).unsqueeze(0).unsqueeze(-1)
-        sim = sim.masked_fill(~frame_mask, float("-inf"))
         sim = sim.max(dim=2)[0]
-        sim[torch.isinf(sim)] = 0.0
-
         logits = sim.sum(dim=-1) / max(float(self.entity_patch_num), 1.0)
+
         logit_scale = self._safe_logit_scale()
         return logit_scale * logits
 

@@ -111,6 +111,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--lambda_action', type=float, default=0.3, help='Loss weight for action branch.')
     parser.add_argument('--entity_word_pro_num', type=int, default=28, help='Number of text word prototypes for entity branch.')
     parser.add_argument('--entity_patch_num', type=int, default=12, help='Number of visual patch prototypes (including CLS) for entity branch.')
+    parser.add_argument('--disable_entity_query_attention', action='store_true', help='Disable query-attention prototype extraction in entity branch.')
     parser.add_argument('--fusion_grid_step', type=float, default=0.1, help='Grid step for fixed fusion weights.')
     parser.add_argument('--msvd_branch_cache_path', type=str, default='', help='Optional path to offline MSVD text branch cache JSON.')
     parser.add_argument('--text_branch_cache_path', type=str, default='', help='Offline text-branch cache path or directory (preferred for all datasets).')
@@ -122,6 +123,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
     args.use_entity_branch = not args.disable_entity_branch
     args.use_action_branch = not args.disable_action_branch
+    args.use_entity_query_attention = not args.disable_entity_query_attention
 
     # Check paramenters
     if args.gradient_accumulation_steps < 1:
@@ -500,6 +502,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                     video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
                     visual_output, visual_tokens = model.get_visual_output(video, video_mask, return_hidden_visual=True)
                     entity_video_patch_proto = model.get_entity_video_patch_prototypes(visual_tokens)
+
                     batch_visual_output_list.append((visual_output, entity_video_patch_proto))
                     batch_list_v.append((video_mask,))
                 total_video_num += b
@@ -765,6 +768,11 @@ def main():
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
 
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
+
+                if epoch == args.epochs - 1:
+                    logger.info("Eval on test dataset at final epoch")
+                    R1 = eval_epoch(args, model, test_dataloader, device, n_gpu)
+                    logger.info("Final-epoch Eval R@1: %.4f", R1)
 
                 ## Run on val dataset, this process is *TIME-consuming*.
                 # logger.info("Eval on val dataset")
