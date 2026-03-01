@@ -7,7 +7,7 @@ import torch
 import numpy as np
 import random
 import os
-from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim, search_fusion_weights
+from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim, search_fusion_weights_four
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
@@ -107,8 +107,19 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
     parser.add_argument('--disable_entity_branch', action='store_true', help='Disable entity branch for ablation.')
     parser.add_argument('--disable_action_branch', action='store_true', help='Disable action branch for ablation.')
+    parser.add_argument('--disable_xpool_conditioned_branch', action='store_true', help='Disable x-pool style text-conditioned video embedding for entity/action branches.')
+    parser.add_argument('--disable_cooperative_text_query', action='store_true', help='Disable cooperative entity-action text query refinement before x-pool alignment.')
+    parser.add_argument('--share_xpool_params', action='store_true', help='Share learnable x-pool aligner parameters between entity and action branches.')
+    parser.add_argument('--xpool_num_heads', type=int, default=8, help='Number of attention heads in learnable x-pool aligner.')
+    parser.add_argument('--xpool_dropout', type=float, default=0.1, help='Dropout used in learnable x-pool aligner.')
+    parser.add_argument('--xpool_mlp_ratio', type=float, default=2.0, help='FFN expansion ratio in learnable x-pool aligner.')
+    parser.add_argument('--disable_struct_branch', action='store_true', help='Disable branch-sequence transformer alignment branch.')
+    parser.add_argument('--disable_fused_train_loss', action='store_true', help='Disable learnable fused similarity loss during training.')
     parser.add_argument('--lambda_entity', type=float, default=0.3, help='Loss weight for entity branch.')
     parser.add_argument('--lambda_action', type=float, default=0.3, help='Loss weight for action branch.')
+    parser.add_argument('--lambda_struct', type=float, default=0.3, help='Loss weight for structured branch.')
+    parser.add_argument('--lambda_fused', type=float, default=0.5, help='Loss weight for learnable fused similarity branch.')
+    parser.add_argument('--branch_transformer_layers', type=int, default=2, help='Number of layers for text/video branch transformers.')
     parser.add_argument('--entity_word_pro_num', type=int, default=5, help='Number of text word prototypes for entity branch.')
     parser.add_argument('--entity_patch_num', type=int, default=12, help='Number of visual patch prototypes (including CLS) for entity branch.')
     parser.add_argument('--entity_and_token_id', type=int, default=-1, help='Token id used to split entity text by conjunction "and"; auto-detected when < 0.')
@@ -126,6 +137,10 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
     args.use_entity_branch = not args.disable_entity_branch
     args.use_action_branch = not args.disable_action_branch
+    args.use_xpool_conditioned_branch = not args.disable_xpool_conditioned_branch
+    args.use_cooperative_text_query = not args.disable_cooperative_text_query
+    args.use_struct_branch = not args.disable_struct_branch
+    args.use_fused_train_loss = not args.disable_fused_train_loss
     args.use_entity_query_attention = not args.disable_entity_query_attention
 
     # Check paramenters
@@ -297,9 +312,17 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     total_loss_global = 0
     total_loss_entity = 0
     total_loss_action = 0
+    total_loss_struct = 0
+    total_loss_fused = 0
     total_score_global = 0
     total_score_entity = 0
     total_score_action = 0
+    total_score_struct = 0
+    total_score_fused = 0
+    total_fusion_wg = 0
+    total_fusion_we = 0
+    total_fusion_wa = 0
+    total_fusion_ws = 0
     total_entity_fallback = 0
     total_action_fallback = 0
     total_fallback_count = 0
@@ -348,9 +371,17 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             total_loss_global += float(model_outputs["loss_global"])
             total_loss_entity += float(model_outputs["loss_entity"])
             total_loss_action += float(model_outputs["loss_action"])
+            total_loss_struct += float(model_outputs.get("loss_struct", 0.0))
+            total_loss_fused += float(model_outputs.get("loss_fused", 0.0))
             total_score_global += float(model_outputs["score_global_mean"])
             total_score_entity += float(model_outputs["score_entity_mean"])
             total_score_action += float(model_outputs["score_action_mean"])
+            total_score_struct += float(model_outputs.get("score_struct_mean", 0.0))
+            total_score_fused += float(model_outputs.get("score_fused_mean", 0.0))
+            total_fusion_wg += float(model_outputs.get("fusion_wg", 0.0))
+            total_fusion_we += float(model_outputs.get("fusion_we", 0.0))
+            total_fusion_wa += float(model_outputs.get("fusion_wa", 0.0))
+            total_fusion_ws += float(model_outputs.get("fusion_ws", 0.0))
         total_entity_fallback += float(entity_fallback.float().mean().item())
         total_action_fallback += float(action_fallback.float().mean().item())
         total_fallback_count += 1
@@ -368,21 +399,33 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             # https://github.com/openai/CLIP/issues/46
             if hasattr(model, 'module'):
                 torch.clamp_(model.module.clip.logit_scale.data, max=np.log(100))
+                if hasattr(model.module, 'entity_logit_scale'):
+                    torch.clamp_(model.module.entity_logit_scale.data, max=np.log(100))
             else:
                 torch.clamp_(model.clip.logit_scale.data, max=np.log(100))
+                if hasattr(model, 'entity_logit_scale'):
+                    torch.clamp_(model.entity_logit_scale.data, max=np.log(100))
 
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
-                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Lg: %f, Le: %f, La: %f, Sg: %f, Se: %f, Sa: %f, EFb: %.4f, AFb: %.4f, Time/step: %f", epoch + 1,
+                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Lg: %f, Le: %f, La: %f, Ls: %f, Lf: %f, Sg: %f, Se: %f, Sa: %f, Ss: %f, Sf: %f, Wg: %.3f, We: %.3f, Wa: %.3f, Ws: %.3f, EFb: %.4f, AFb: %.4f, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
                             total_loss_global / max(step + 1, 1),
                             total_loss_entity / max(step + 1, 1),
                             total_loss_action / max(step + 1, 1),
+                            total_loss_struct / max(step + 1, 1),
+                            total_loss_fused / max(step + 1, 1),
                             total_score_global / max(step + 1, 1),
                             total_score_entity / max(step + 1, 1),
                             total_score_action / max(step + 1, 1),
+                            total_score_struct / max(step + 1, 1),
+                            total_score_fused / max(step + 1, 1),
+                            total_fusion_wg / max(step + 1, 1),
+                            total_fusion_we / max(step + 1, 1),
+                            total_fusion_wa / max(step + 1, 1),
+                            total_fusion_ws / max(step + 1, 1),
                             total_entity_fallback / max(total_fallback_count, 1),
                             total_action_fallback / max(total_fallback_count, 1),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
@@ -395,20 +438,22 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
     sim_matrix_global = []
     sim_matrix_entity = []
     sim_matrix_action = []
+    sim_matrix_struct = []
     for idx1, b1 in enumerate(batch_list_t):
         input_mask, entity_input_mask, action_input_mask, *_tmp = b1
         input_mask = input_mask.view(-1, input_mask.shape[-1])
         entity_input_mask = entity_input_mask.view(-1, entity_input_mask.shape[-1])
         action_input_mask = action_input_mask.view(-1, action_input_mask.shape[-1])
-        sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto, entity_word_proto_mask = batch_sequence_output_list[idx1]
+        sequence_output, entity_sequence_output, action_sequence_output = batch_sequence_output_list[idx1]
         each_row_global = []
         each_row_entity = []
         each_row_action = []
+        each_row_struct = []
         for idx2, b2 in enumerate(batch_list_v):
             video_mask, *_tmp = b2
             video_mask = video_mask.view(-1, video_mask.shape[-1])
-            visual_output, entity_video_patch_proto = batch_visual_output_list[idx2]
-            logits_global, logits_entity, logits_action = model.get_multi_branch_similarity_logits(
+            visual_output = batch_visual_output_list[idx2][0]
+            logits_global, logits_entity, logits_action, logits_struct = model.get_multi_branch_similarity_logits(
                 sequence_output,
                 entity_sequence_output,
                 action_sequence_output,
@@ -417,18 +462,20 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
                 entity_input_mask,
                 action_input_mask,
                 video_mask,
-                entity_word_proto=entity_word_proto,
-                entity_word_proto_mask=entity_word_proto_mask,
-                entity_video_patch_proto=entity_video_patch_proto,
                 loose_type=model.loose_type,
+                return_struct=True,
             )
+            if logits_struct is None:
+                logits_struct = torch.zeros_like(logits_global)
             each_row_global.append(logits_global.cpu().detach().numpy())
             each_row_entity.append(logits_entity.cpu().detach().numpy())
             each_row_action.append(logits_action.cpu().detach().numpy())
+            each_row_struct.append(logits_struct.cpu().detach().numpy())
         sim_matrix_global.append(np.concatenate(tuple(each_row_global), axis=-1))
         sim_matrix_entity.append(np.concatenate(tuple(each_row_entity), axis=-1))
         sim_matrix_action.append(np.concatenate(tuple(each_row_action), axis=-1))
-    return sim_matrix_global, sim_matrix_entity, sim_matrix_action
+        sim_matrix_struct.append(np.concatenate(tuple(each_row_struct), axis=-1))
+    return sim_matrix_global, sim_matrix_entity, sim_matrix_action, sim_matrix_struct
 
 def eval_epoch(args, model, test_dataloader, device, n_gpu):
 
@@ -495,16 +542,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 sequence_output = model.get_sequence_output(input_ids, segment_ids, input_mask)
                 entity_sequence_output = model.get_sequence_output(entity_input_ids, entity_segment_ids, entity_input_mask)
                 action_sequence_output = model.get_sequence_output(action_input_ids, action_segment_ids, action_input_mask)
-                entity_word_proto, entity_word_proto_mask = model.get_entity_text_word_prototypes(
-                    entity_input_ids,
-                    entity_input_mask,
-                    action_input_ids=action_input_ids,
-                    action_attention_mask=action_input_mask,
-                    caption_input_ids=input_ids,
-                    caption_attention_mask=input_mask,
-                    caption_sequence_output=sequence_output,
-                )
-                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto, entity_word_proto_mask))
+                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output))
                 batch_list_t.append((input_mask, entity_input_mask, action_input_mask,))
 
                 s_, e_ = total_video_num, total_video_num + b
@@ -512,38 +550,25 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
 
                 if len(filter_inds) > 0:
                     video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
-                    visual_output, visual_tokens = model.get_visual_output(video, video_mask, return_hidden_visual=True)
-                    entity_video_patch_proto = model.get_entity_video_patch_prototypes(visual_tokens)
-
-                    batch_visual_output_list.append((visual_output, entity_video_patch_proto))
+                    visual_output = model.get_visual_output(video, video_mask, return_hidden_visual=False)
+                    batch_visual_output_list.append((visual_output,))
                     batch_list_v.append((video_mask,))
                 total_video_num += b
             else:
-                sequence_output, visual_output, visual_tokens = model.get_sequence_visual_output(
+                sequence_output, visual_output = model.get_sequence_visual_output(
                     input_ids,
                     segment_ids,
                     input_mask,
                     video,
                     video_mask,
-                    return_hidden_visual=True,
+                    return_hidden_visual=False,
                 )
                 entity_sequence_output = model.get_sequence_output(entity_input_ids, entity_segment_ids, entity_input_mask)
                 action_sequence_output = model.get_sequence_output(action_input_ids, action_segment_ids, action_input_mask)
-                entity_word_proto, entity_word_proto_mask = model.get_entity_text_word_prototypes(
-                    entity_input_ids,
-                    entity_input_mask,
-                    action_input_ids=action_input_ids,
-                    action_attention_mask=action_input_mask,
-                    caption_input_ids=input_ids,
-                    caption_attention_mask=input_mask,
-                    caption_sequence_output=sequence_output,
-                )
-                entity_video_patch_proto = model.get_entity_video_patch_prototypes(visual_tokens)
-
-                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output, entity_word_proto, entity_word_proto_mask))
+                batch_sequence_output_list.append((sequence_output, entity_sequence_output, action_sequence_output))
                 batch_list_t.append((input_mask, entity_input_mask, action_input_mask,))
 
-                batch_visual_output_list.append((visual_output, entity_video_patch_proto))
+                batch_visual_output_list.append((visual_output,))
                 batch_list_v.append((video_mask,))
 
             print("{}/{}\r".format(bid, len(test_dataloader)), end="")
@@ -586,15 +611,18 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
             sim_matrix_global = []
             sim_matrix_entity = []
             sim_matrix_action = []
+            sim_matrix_struct = []
             for idx in range(len(parallel_outputs)):
                 sim_matrix_global += parallel_outputs[idx][0]
                 sim_matrix_entity += parallel_outputs[idx][1]
                 sim_matrix_action += parallel_outputs[idx][2]
+                sim_matrix_struct += parallel_outputs[idx][3]
             sim_matrix_global = np.concatenate(tuple(sim_matrix_global), axis=0)
             sim_matrix_entity = np.concatenate(tuple(sim_matrix_entity), axis=0)
             sim_matrix_action = np.concatenate(tuple(sim_matrix_action), axis=0)
+            sim_matrix_struct = np.concatenate(tuple(sim_matrix_struct), axis=0)
         else:
-            sim_matrix_global, sim_matrix_entity, sim_matrix_action = _run_on_single_gpu(
+            sim_matrix_global, sim_matrix_entity, sim_matrix_action, sim_matrix_struct = _run_on_single_gpu(
                 model,
                 batch_list_t,
                 batch_list_v,
@@ -604,6 +632,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
             sim_matrix_global = np.concatenate(tuple(sim_matrix_global), axis=0)
             sim_matrix_entity = np.concatenate(tuple(sim_matrix_entity), axis=0)
             sim_matrix_action = np.concatenate(tuple(sim_matrix_action), axis=0)
+            sim_matrix_struct = np.concatenate(tuple(sim_matrix_struct), axis=0)
 
     def _reshape_multi_sentence(sim_matrix):
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
@@ -615,10 +644,11 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         return np.stack(tuple(sim_matrix_new), axis=0)
 
     if multi_sentence_:
-        logger.info("before reshape, global/entity/action matrix size: {} x {}".format(sim_matrix_global.shape[0], sim_matrix_global.shape[1]))
+        logger.info("before reshape, global/entity/action/struct matrix size: {} x {}".format(sim_matrix_global.shape[0], sim_matrix_global.shape[1]))
         sim_matrix_global = _reshape_multi_sentence(sim_matrix_global)
         sim_matrix_entity = _reshape_multi_sentence(sim_matrix_entity)
         sim_matrix_action = _reshape_multi_sentence(sim_matrix_action)
+        sim_matrix_struct = _reshape_multi_sentence(sim_matrix_struct)
         logger.info("after reshape, global matrix size: {} x {} x {}".
                     format(sim_matrix_global.shape[0], sim_matrix_global.shape[1], sim_matrix_global.shape[2]))
 
@@ -626,12 +656,14 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         vt_metrics_global = compute_metrics(tensor_video_to_text_sim(sim_matrix_global))
         tv_metrics_entity = tensor_text_to_video_metrics(sim_matrix_entity)
         tv_metrics_action = tensor_text_to_video_metrics(sim_matrix_action)
+        tv_metrics_struct = tensor_text_to_video_metrics(sim_matrix_struct)
     else:
-        logger.info("global/entity/action sim matrix size: {}, {}".format(sim_matrix_global.shape[0], sim_matrix_global.shape[1]))
+        logger.info("global/entity/action/struct sim matrix size: {}, {}".format(sim_matrix_global.shape[0], sim_matrix_global.shape[1]))
         tv_metrics_global = compute_metrics(sim_matrix_global)
         vt_metrics_global = compute_metrics(sim_matrix_global.T)
         tv_metrics_entity = compute_metrics(sim_matrix_entity)
         tv_metrics_action = compute_metrics(sim_matrix_action)
+        tv_metrics_struct = compute_metrics(sim_matrix_struct)
         logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix_global), len(sim_matrix_global[0])))
 
     logger.info("Branch Text-to-Video:")
@@ -641,16 +673,21 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 format(tv_metrics_entity['R1'], tv_metrics_entity['R5'], tv_metrics_entity['R10']))
     logger.info('\tAction >>> R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}'.
                 format(tv_metrics_action['R1'], tv_metrics_action['R5'], tv_metrics_action['R10']))
+    logger.info('\tStruct >>> R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}'.
+                format(tv_metrics_struct['R1'], tv_metrics_struct['R5'], tv_metrics_struct['R10']))
 
     if not args.use_entity_branch:
         sim_matrix_entity = np.zeros_like(sim_matrix_global)
     if not args.use_action_branch:
         sim_matrix_action = np.zeros_like(sim_matrix_global)
+    if not args.use_struct_branch:
+        sim_matrix_struct = np.zeros_like(sim_matrix_global)
 
-    fusion_result = search_fusion_weights(
+    fusion_result = search_fusion_weights_four(
         sim_matrix_global,
         sim_matrix_entity,
         sim_matrix_action,
+        sim_matrix_struct,
         val_labels=None,
         step=args.fusion_grid_step,
     )
@@ -665,8 +702,8 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         vt_metrics_fused = compute_metrics(sim_matrix_fused.T)
 
     logger.info("Fixed-weight Fusion:")
-    logger.info('\tBest Weights (R@1 first): wg={:.2f}, we={:.2f}, wa={:.2f}'.format(
-        best_weights["w_g"], best_weights["w_e"], best_weights["w_a"]))
+    logger.info('\tBest Weights (R@1 first): wg={:.2f}, we={:.2f}, wa={:.2f}, ws={:.2f}'.format(
+        best_weights["w_g"], best_weights["w_e"], best_weights["w_a"], best_weights["w_s"]))
     logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                 format(tv_metrics_fused['R1'], tv_metrics_fused['R5'], tv_metrics_fused['R10'], tv_metrics_fused['MR'], tv_metrics_fused['MeanR']))
     logger.info("Video-to-Text (Fusion):")

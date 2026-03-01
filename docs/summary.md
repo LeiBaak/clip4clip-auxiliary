@@ -62,3 +62,17 @@ entity template单独编码
 2026-02-28 17:08:59,117:INFO: 	>>>  V2T$R@1: 38.4 - V2T$R@5: 58.8 - V2T$R@10: 63.3 - V2T$Median R: 3.0 - V2T$Mean R: 21.3
 2026-02-28 17:08:59,117:INFO: Eval fallback rate: entity=0.0042, action=0.0613
 2026-02-28 17:08:59,148:INFO: Final-epoch Eval R@1: 44.0550
+
+用 global/entity/action/struct 四分支联合检索，其中 entity 与 action 采用 text-conditioned xpool 纯算子（相似度、softmax、加权求和）视频对齐、struct 用文本侧与视频侧各自两层 Transformer 做分支级结构对齐（global entity action各占一个槽位），
+2026-03-01 01:15:08,555:INFO: Branch Text-to-Video:
+2026-03-01 01:15:08,555:INFO: 	Global >>> R@1: 44.9 - R@5: 74.8 - R@10: 83.6
+2026-03-01 01:15:08,556:INFO: 	Entity >>> R@1: 30.8 - R@5: 60.2 - R@10: 71.7
+2026-03-01 01:15:08,556:INFO: 	Action >>> R@1: 33.5 - R@5: 63.3 - R@10: 74.3
+2026-03-01 01:15:08,556:INFO: 	Struct >>> R@1: 36.5 - R@5: 69.1 - R@10: 80.2
+2026-03-01 01:29:11,639:INFO: Fixed-weight Fusion:
+2026-03-01 01:29:11,639:INFO: 	Best Weights (R@1 first): wg=0.70, we=0.20, wa=0.00, ws=0.10
+2026-03-01 01:29:11,639:INFO: 	>>>  R@1: 45.5 - R@5: 75.6 - R@10: 84.2 - Median R: 2.0 - Mean R: 10.9
+2026-03-01 01:29:11,639:INFO: Video-to-Text (Fusion):
+2026-03-01 01:29:11,639:INFO: 	>>>  V2T$R@1: 39.4 - V2T$R@5: 67.0 - V2T$R@10: 74.5 - V2T$Median R: 2.0 - V2T$Mean R: 14.9
+2026-03-01 01:29:11,639:INFO: Eval fallback rate: entity=0.0042, action=0.0613
+2026-03-01 01:29:11,663:INFO: Final-epoch Eval R@1: 45.4634
