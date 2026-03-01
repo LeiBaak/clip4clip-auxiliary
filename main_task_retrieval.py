@@ -39,6 +39,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--epochs', type=int, default=20, help='upper epoch limit')
     parser.add_argument('--batch_size', type=int, default=256, help='batch size')
     parser.add_argument('--batch_size_val', type=int, default=3500, help='batch size eval')
+    parser.add_argument('--eval_batch_size_scale', type=int, default=4, help='Scale factor applied to batch_size_val for eval-epoch dataloaders.')
     parser.add_argument('--lr_decay', type=float, default=0.9, help='Learning rate exp epoch decay')
     parser.add_argument('--n_display', type=int, default=100, help='Information display frequence')
     parser.add_argument('--video_dim', type=int, default=1024, help='video feature dimension')
@@ -109,7 +110,17 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--disable_action_branch', action='store_true', help='Disable action branch for ablation.')
     parser.add_argument('--disable_xpool_conditioned_branch', action='store_true', help='Disable x-pool style text-conditioned video embedding for entity/action branches.')
     parser.add_argument('--disable_cooperative_text_query', action='store_true', help='Disable cooperative entity-action text query refinement before x-pool alignment.')
+    parser.add_argument('--disable_branch_text_adapter', action='store_true', help='Disable branch-specific text adapters for entity/action when using shared text encoder.')
     parser.add_argument('--share_xpool_params', action='store_true', help='Share learnable x-pool aligner parameters between entity and action branches.')
+    parser.add_argument('--enable_query_slot_branch', action='store_true', help='Enable query-slot video branch for entity/action alignment.')
+    parser.add_argument('--slot_num_queries', type=int, default=8, help='Number of learnable query slots in query-slot branch.')
+    parser.add_argument('--slot_topk_entity', type=int, default=3, help='Top-k slots selected per text-video pair for entity alignment.')
+    parser.add_argument('--slot_topk_action', type=int, default=2, help='Top-k slots selected per text-video pair for action alignment.')
+    parser.add_argument('--slot_branch_layers', type=int, default=1, help='Number of transformer layers over slot tokens.')
+    parser.add_argument('--slot_attn_dropout', type=float, default=0.1, help='Dropout on slot attention probabilities.')
+    parser.add_argument('--disable_slot_post_ffn', action='store_true', help='Disable post-FFN residual block on slot features.')
+    parser.add_argument('--lambda_slot_diversity', type=float, default=0.02, help='Regularization weight for slot diversity loss.')
+    parser.add_argument('--lambda_slot_balance', type=float, default=0.01, help='Regularization weight for slot usage balance loss.')
     parser.add_argument('--xpool_num_heads', type=int, default=8, help='Number of attention heads in learnable x-pool aligner.')
     parser.add_argument('--xpool_dropout', type=float, default=0.1, help='Dropout used in learnable x-pool aligner.')
     parser.add_argument('--xpool_mlp_ratio', type=float, default=2.0, help='FFN expansion ratio in learnable x-pool aligner.')
@@ -139,6 +150,8 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     args.use_action_branch = not args.disable_action_branch
     args.use_xpool_conditioned_branch = not args.disable_xpool_conditioned_branch
     args.use_cooperative_text_query = not args.disable_cooperative_text_query
+    args.use_branch_text_adapter = not args.disable_branch_text_adapter
+    args.use_slot_post_ffn = not args.disable_slot_post_ffn
     args.use_struct_branch = not args.disable_struct_branch
     args.use_fused_train_loss = not args.disable_fused_train_loss
     args.use_entity_query_attention = not args.disable_entity_query_attention
@@ -153,8 +166,21 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
         raise ValueError("entity_word_pro_num must be >= 1")
     if args.entity_patch_num < 2:
         raise ValueError("entity_patch_num must be >= 2")
+    if args.eval_batch_size_scale < 1:
+        raise ValueError("eval_batch_size_scale must be >= 1")
+    if args.slot_num_queries < 1:
+        raise ValueError("slot_num_queries must be >= 1")
+    if args.slot_topk_entity < 1:
+        raise ValueError("slot_topk_entity must be >= 1")
+    if args.slot_topk_action < 1:
+        raise ValueError("slot_topk_action must be >= 1")
+    if args.slot_branch_layers < 0:
+        raise ValueError("slot_branch_layers must be >= 0")
+    if args.slot_attn_dropout < 0.0 or args.slot_attn_dropout >= 1.0:
+        raise ValueError("slot_attn_dropout must be in [0, 1)")
 
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
+    args.batch_size_val = int(args.batch_size_val * args.eval_batch_size_scale)
 
     return args
 
@@ -314,6 +340,8 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     total_loss_action = 0
     total_loss_struct = 0
     total_loss_fused = 0
+    total_loss_slot_div = 0
+    total_loss_slot_bal = 0
     total_score_global = 0
     total_score_entity = 0
     total_score_action = 0
@@ -373,6 +401,8 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             total_loss_action += float(model_outputs["loss_action"])
             total_loss_struct += float(model_outputs.get("loss_struct", 0.0))
             total_loss_fused += float(model_outputs.get("loss_fused", 0.0))
+            total_loss_slot_div += float(model_outputs.get("loss_slot_div", 0.0))
+            total_loss_slot_bal += float(model_outputs.get("loss_slot_bal", 0.0))
             total_score_global += float(model_outputs["score_global_mean"])
             total_score_entity += float(model_outputs["score_entity_mean"])
             total_score_action += float(model_outputs["score_action_mean"])
@@ -401,14 +431,18 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                 torch.clamp_(model.module.clip.logit_scale.data, max=np.log(100))
                 if hasattr(model.module, 'entity_logit_scale'):
                     torch.clamp_(model.module.entity_logit_scale.data, max=np.log(100))
+                if hasattr(model.module, 'action_logit_scale'):
+                    torch.clamp_(model.module.action_logit_scale.data, max=np.log(100))
             else:
                 torch.clamp_(model.clip.logit_scale.data, max=np.log(100))
                 if hasattr(model, 'entity_logit_scale'):
                     torch.clamp_(model.entity_logit_scale.data, max=np.log(100))
+                if hasattr(model, 'action_logit_scale'):
+                    torch.clamp_(model.action_logit_scale.data, max=np.log(100))
 
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
-                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Lg: %f, Le: %f, La: %f, Ls: %f, Lf: %f, Sg: %f, Se: %f, Sa: %f, Ss: %f, Sf: %f, Wg: %.3f, We: %.3f, Wa: %.3f, Ws: %.3f, EFb: %.4f, AFb: %.4f, Time/step: %f", epoch + 1,
+                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Lg: %f, Le: %f, La: %f, Ls: %f, Lf: %f, Lsd: %f, Lsb: %f, Sg: %f, Se: %f, Sa: %f, Ss: %f, Sf: %f, Wg: %.3f, We: %.3f, Wa: %.3f, Ws: %.3f, EFb: %.4f, AFb: %.4f, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
@@ -417,6 +451,8 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             total_loss_action / max(step + 1, 1),
                             total_loss_struct / max(step + 1, 1),
                             total_loss_fused / max(step + 1, 1),
+                            total_loss_slot_div / max(step + 1, 1),
+                            total_loss_slot_bal / max(step + 1, 1),
                             total_score_global / max(step + 1, 1),
                             total_score_entity / max(step + 1, 1),
                             total_score_action / max(step + 1, 1),

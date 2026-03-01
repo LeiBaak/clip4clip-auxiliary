@@ -346,18 +346,24 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.loss_fct = CrossEn()
         self.entity_logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
+        self.action_logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
 
         self.use_entity_branch = True
         self.use_action_branch = True
         self.use_xpool_conditioned_branch = True
         self.share_xpool_params = False
         self.use_cooperative_text_query = True
+        self.use_branch_text_adapter = True
+        self.use_slot_post_ffn = True
+        self.use_query_slot_branch = False
         self.use_struct_branch = True
         self.use_fused_train_loss = True
         self.lambda_entity = 0.3
         self.lambda_action = 0.3
         self.lambda_struct = 0.3
         self.lambda_fused = 0.5
+        self.lambda_slot_diversity = 0.02
+        self.lambda_slot_balance = 0.01
         if hasattr(task_config, "use_entity_branch"):
             self.use_entity_branch = task_config.use_entity_branch
         if hasattr(task_config, "use_action_branch"):
@@ -368,6 +374,12 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             self.share_xpool_params = bool(task_config.share_xpool_params)
         if hasattr(task_config, "use_cooperative_text_query"):
             self.use_cooperative_text_query = bool(task_config.use_cooperative_text_query)
+        if hasattr(task_config, "use_branch_text_adapter"):
+            self.use_branch_text_adapter = bool(task_config.use_branch_text_adapter)
+        if hasattr(task_config, "use_slot_post_ffn"):
+            self.use_slot_post_ffn = bool(task_config.use_slot_post_ffn)
+        if hasattr(task_config, "enable_query_slot_branch"):
+            self.use_query_slot_branch = bool(task_config.enable_query_slot_branch)
         if hasattr(task_config, "use_struct_branch"):
             self.use_struct_branch = bool(task_config.use_struct_branch)
         if hasattr(task_config, "use_fused_train_loss"):
@@ -380,6 +392,10 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             self.lambda_struct = float(task_config.lambda_struct)
         if hasattr(task_config, "lambda_fused"):
             self.lambda_fused = float(task_config.lambda_fused)
+        if hasattr(task_config, "lambda_slot_diversity"):
+            self.lambda_slot_diversity = float(task_config.lambda_slot_diversity)
+        if hasattr(task_config, "lambda_slot_balance"):
+            self.lambda_slot_balance = float(task_config.lambda_slot_balance)
 
         self.entity_word_pro_num = 28
         self.entity_patch_num = 12
@@ -452,6 +468,55 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
+        self.entity_text_adapter = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim, embed_dim),
+            nn.Dropout(0.1),
+        )
+        self.action_text_adapter = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim, embed_dim),
+            nn.Dropout(0.1),
+        )
+
+        self.slot_num_queries = max(1, int(getattr(task_config, "slot_num_queries", 8)))
+        self.slot_topk_entity = max(1, int(getattr(task_config, "slot_topk_entity", 3)))
+        self.slot_topk_action = max(1, int(getattr(task_config, "slot_topk_action", 2)))
+        self.slot_branch_layers = max(0, int(getattr(task_config, "slot_branch_layers", 1)))
+        self.slot_attn_dropout_prob = float(getattr(task_config, "slot_attn_dropout", 0.1))
+        self.slot_queries = nn.Parameter(torch.randn(self.slot_num_queries, embed_dim) * 0.02)
+        self.slot_key_proj = nn.Linear(embed_dim, embed_dim)
+        self.slot_value_proj = nn.Linear(embed_dim, embed_dim)
+        self.slot_attn_dropout = nn.Dropout(self.slot_attn_dropout_prob)
+        self.slot_post_norm_entity = nn.LayerNorm(embed_dim)
+        self.slot_post_norm_action = nn.LayerNorm(embed_dim)
+        self.slot_post_ffn_entity = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Dropout(0.1),
+        )
+        self.slot_post_ffn_action = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Dropout(0.1),
+        )
+        self.slot_temporal_encoder = BranchTransformerEncoder(
+            hidden_size=embed_dim,
+            num_layers=max(1, self.slot_branch_layers),
+            num_heads=max(1, embed_dim // 64),
+            mlp_ratio=2.0,
+            dropout=0.1,
+        )
 
         self.learned_fusion_logits = nn.Parameter(torch.ones(4, dtype=torch.float))
 
@@ -518,6 +583,10 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         entity_logit_scale_param = torch.clamp(self.entity_logit_scale, max=math.log(100.0))
         return entity_logit_scale_param.exp()
 
+    def _safe_action_logit_scale(self):
+        action_logit_scale_param = torch.clamp(self.action_logit_scale, max=math.log(100.0))
+        return action_logit_scale_param.exp()
+
     def _safe_l2_normalize(self, tensor, dim=-1, eps=1e-6):
         denom = torch.clamp(tensor.norm(dim=dim, keepdim=True), min=eps)
         return tensor / denom
@@ -559,6 +628,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 text_embed = torch.sum(sequence_output * attention_mask_un, dim=1) / denom
         text_embed = self._safe_l2_normalize(text_embed)
         return text_embed
+
+    def _apply_branch_text_adapter(self, text_embed, branch="entity"):
+        if not self.use_branch_text_adapter:
+            return text_embed
+        if branch == "action":
+            delta = self.action_text_adapter(text_embed)
+        else:
+            delta = self.entity_text_adapter(text_embed)
+        return self._safe_l2_normalize(text_embed + delta, dim=-1)
 
     def _pool_entity_video_embed(self, visual_output, video_mask):
         """
@@ -650,7 +728,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         logits = torch.einsum("ad,abd->ab", text_embed, conditioned_video)
         if use_entity_temp:
             return self._safe_entity_logit_scale() * logits
-        return self._safe_logit_scale() * logits
+        return self._safe_action_logit_scale() * logits
 
     def _structured_branch_similarity_logits(
             self,
@@ -683,6 +761,83 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         text_embed = self._safe_l2_normalize(text_tokens.mean(dim=1), dim=-1)
         video_embed = self._safe_l2_normalize(video_tokens.mean(dim=1), dim=-1)
         return self._branch_similarity_logits(text_embed, video_embed)
+
+    def _compute_query_slot_features(self, visual_output, video_mask):
+        visual_feat = self._safe_l2_normalize(visual_output, dim=-1)
+        key_feat = self._safe_l2_normalize(self.slot_key_proj(visual_feat), dim=-1)
+        value_feat = self.slot_value_proj(visual_feat)
+
+        query_feat = self._safe_l2_normalize(self.slot_queries, dim=-1)
+        slot_score = torch.einsum("md,btd->bmt", query_feat, key_feat)
+        slot_score = slot_score.masked_fill(video_mask.unsqueeze(1) <= 0, -1e4)
+        slot_attn = torch.softmax(slot_score, dim=-1)
+        slot_attn = self.slot_attn_dropout(slot_attn)
+
+        slot_static = torch.einsum("bmt,btd->bmd", slot_attn, value_feat)
+
+        diff_feat = torch.zeros_like(value_feat)
+        if value_feat.size(1) > 1:
+            diff_feat[:, 1:, :] = value_feat[:, 1:, :] - value_feat[:, :-1, :]
+        diff_mask = video_mask.clone()
+        if diff_mask.size(1) > 1:
+            diff_mask[:, 0] = 0
+            diff_mask[:, 1:] = diff_mask[:, 1:] * diff_mask[:, :-1]
+        diff_feat = diff_feat * diff_mask.unsqueeze(-1).to(diff_feat.dtype)
+        slot_action = torch.einsum("bmt,btd->bmd", slot_attn, diff_feat)
+
+        if self.slot_branch_layers > 0:
+            slot_static = self.slot_temporal_encoder(slot_static)
+            slot_action = self.slot_temporal_encoder(slot_action)
+
+        if self.use_slot_post_ffn:
+            slot_static = slot_static + self.slot_post_ffn_entity(self.slot_post_norm_entity(slot_static))
+            slot_action = slot_action + self.slot_post_ffn_action(self.slot_post_norm_action(slot_action))
+
+        slot_static = self._safe_l2_normalize(slot_static, dim=-1)
+        slot_action = self._safe_l2_normalize(slot_action, dim=-1)
+        return slot_static, slot_action, slot_attn
+
+    def _slot_conditioned_similarity_logits(self, text_embed, slot_feat, topk=2, use_entity_temp=False):
+        if self.training:
+            text_embed = allgather(text_embed, self.task_config)
+            slot_feat = allgather(slot_feat, self.task_config)
+            torch.distributed.barrier()
+
+        text_embed = self._safe_l2_normalize(text_embed, dim=-1)
+        slot_feat = self._safe_l2_normalize(slot_feat, dim=-1)
+
+        sim_slot = torch.einsum("ad,bmd->abm", text_embed, slot_feat)
+        topk = min(max(int(topk), 1), sim_slot.size(-1))
+        topv, topi = torch.topk(sim_slot, k=topk, dim=-1)
+        topw = torch.softmax(topv, dim=-1)
+
+        text_batch = sim_slot.size(0)
+        video_batch = sim_slot.size(1)
+        feat_dim = slot_feat.size(-1)
+        slot_feat_expand = slot_feat.unsqueeze(0).expand(text_batch, -1, -1, -1)
+        gather_index = topi.unsqueeze(-1).expand(-1, -1, -1, feat_dim)
+        selected_slot = torch.gather(slot_feat_expand, dim=2, index=gather_index)
+        conditioned_video = torch.sum(selected_slot * topw.unsqueeze(-1), dim=2)
+        conditioned_video = self._safe_l2_normalize(conditioned_video, dim=-1)
+
+        logits = torch.einsum("ad,abd->ab", text_embed, conditioned_video)
+        if use_entity_temp:
+            return self._safe_entity_logit_scale() * logits
+        return self._safe_action_logit_scale() * logits
+
+    def _query_slot_regularization(self, slot_attn, slot_static):
+        slot_mean = self._safe_l2_normalize(slot_static.mean(dim=0), dim=-1)
+        cosine = torch.matmul(slot_mean, slot_mean.t())
+        identity = torch.eye(cosine.size(0), device=cosine.device, dtype=cosine.dtype)
+        offdiag = cosine * (1.0 - identity)
+        loss_div = torch.mean(offdiag.pow(2))
+
+        usage = slot_attn.mean(dim=(0, 2))
+        usage = torch.clamp(usage, min=1e-6)
+        usage = usage / usage.sum()
+        target = torch.full_like(usage, 1.0 / usage.numel())
+        loss_bal = torch.sum(usage * (torch.log(usage) - torch.log(target)))
+        return loss_div, loss_bal
 
     def get_entity_text_word_prototypes(
         self,
@@ -952,20 +1107,37 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             text_entity_embed,
             text_action_embed,
         )
+        text_entity_embed = self._apply_branch_text_adapter(text_entity_embed, branch="entity")
+        text_action_embed = self._apply_branch_text_adapter(text_action_embed, branch="action")
 
         if self.use_xpool_conditioned_branch:
-            logits_entity = self._xpool_conditioned_similarity_logits(
-                text_entity_embed,
-                visual_output,
-                video_mask,
-                use_entity_temp=True,
-            )
-            logits_action = self._xpool_conditioned_similarity_logits(
-                text_action_embed,
-                visual_output,
-                video_mask,
-                use_entity_temp=False,
-            )
+            if self.use_query_slot_branch:
+                slot_static, slot_action, _ = self._compute_query_slot_features(visual_output, video_mask)
+                logits_entity = self._slot_conditioned_similarity_logits(
+                    text_entity_embed,
+                    slot_static,
+                    topk=self.slot_topk_entity,
+                    use_entity_temp=True,
+                )
+                logits_action = self._slot_conditioned_similarity_logits(
+                    text_action_embed,
+                    slot_action,
+                    topk=self.slot_topk_action,
+                    use_entity_temp=False,
+                )
+            else:
+                logits_entity = self._xpool_conditioned_similarity_logits(
+                    text_entity_embed,
+                    visual_output,
+                    video_mask,
+                    use_entity_temp=True,
+                )
+                logits_action = self._xpool_conditioned_similarity_logits(
+                    text_action_embed,
+                    visual_output,
+                    video_mask,
+                    use_entity_temp=False,
+                )
         else:
             video_entity_embed = self._pool_entity_video_embed(visual_output, video_mask)
             video_action_embed = self._pool_action_video_embed(visual_output, video_mask)
@@ -1068,6 +1240,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 return_struct=True,
             )
 
+            if self.use_query_slot_branch:
+                slot_static, _, slot_attn = self._compute_query_slot_features(visual_output, video_mask)
+                loss_slot_div, loss_slot_bal = self._query_slot_regularization(slot_attn, slot_static)
+            else:
+                loss_slot_div = torch.zeros((), device=sequence_output.device, dtype=sequence_output.dtype)
+                loss_slot_bal = torch.zeros((), device=sequence_output.device, dtype=sequence_output.dtype)
+
             loss_global = (self.loss_fct(logits_global) + self.loss_fct(logits_global.T)) / 2
 
             if self.use_entity_branch:
@@ -1096,6 +1275,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 loss_fused = torch.zeros_like(loss_global)
 
             total_loss = loss_global + self.lambda_entity * loss_entity + self.lambda_action * loss_action + self.lambda_struct * loss_struct + self.lambda_fused * loss_fused
+            total_loss = total_loss + self.lambda_slot_diversity * loss_slot_div + self.lambda_slot_balance * loss_slot_bal
             return {
                 "loss": total_loss,
                 "loss_global": loss_global.detach(),
@@ -1103,6 +1283,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 "loss_action": loss_action.detach(),
                 "loss_struct": loss_struct.detach(),
                 "loss_fused": loss_fused.detach(),
+                "loss_slot_div": loss_slot_div.detach(),
+                "loss_slot_bal": loss_slot_bal.detach(),
                 "score_global_mean": logits_global.mean().detach(),
                 "score_entity_mean": logits_entity.mean().detach(),
                 "score_action_mean": logits_action.mean().detach(),
